@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vibe-coder"
+version = "0.1.0"
+description = "Local-first AI coding companion backed by Ollama"
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.6",
+    "requests>=2.31",
+]
+
+[project.scripts]
+vibe-coder = "vibe_coder.main:main"
+
+[tool.setuptools.packages.find]
+include = ["vibe_coder*"]
