@@ -1,44 +1,34 @@
-"""VibeCoder main window: chat UI with attachment scaffolding.
+"""VibeCoder main window: chat UI with conversation management.
 
-Phase 1 intentionally excludes projects, git, and the code editor.
-The attachment pipeline (files -> text embedded in the user message)
-is the same mechanism Phase 2 will use for project files.
+Phase 2 adds conversation persistence, switching, and deletion.
 """
 
 from pathlib import Path
 
 import requests
-import os
-import sys
+import os, sys
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QTextCursor
+from PyQt6.QtGui import QTextCursor, QFont, QMouseEvent
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QMainWindow, QMessageBox, QPushButton, QTextBrowser, QTextEdit,
-    QVBoxLayout, QWidget,
+    QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QTextBrowser, QTextEdit,
+    QVBoxLayout, QWidget, QSplitter, QMenu
 )
 
 from vibe_coder import __version__
 from vibe_coder.config import load_config, save_config
 from vibe_coder.memory import MemoryStore
 from vibe_coder.ollama_client import OllamaClient
+from vibe_coder.conversation_manager import ConversationManager
 
-# Phase 1 attachment cap; Phase 2 will replace ad-hoc reads with
-# project-scoped file access.
 MAX_ATTACHMENT_CHARS = 200_000
 
 if sys.platform.startswith('linux'):
     os.environ.setdefault('QT_QPA_PLATFORMTHEME', 'xdgdesktopportal')
 
 class ChatWorker(QThread):
-    """Streams a chat response off the GUI thread.
-
-    All signals are emitted from this thread's context; slots connected
-    with default AutoConnection are queued onto the GUI thread, so there
-    is no cross-thread widget access (avoids the QNetworkAccessManager /
-    child-object threading class of bugs you've hit before).
-    """
+    """Streams a chat response off the GUI thread."""
 
     chunk_received = pyqtSignal(str)
     finished_ok = pyqtSignal()
@@ -56,10 +46,9 @@ class ChatWorker(QThread):
                 self.chunk_received.emit(delta)
             if not self._client.aborted:
                 self.finished_ok.emit()
-        except Exception as exc:  # noqa: BLE001 - surfaced to GUI slot
+        except Exception as exc:
             if not self._client.aborted:
                 self.failed.emit(str(exc))
-
 
 class ChatInput(QTextEdit):
     """Multi-line input. Enter sends, Shift+Enter inserts a newline."""
@@ -74,9 +63,8 @@ class ChatInput(QTextEdit):
             return
         super().keyPressEvent(event)
 
-
 class MemoryDialog(QDialog):
-    """Manual memory editor. Automatic extraction is deferred by design."""
+    """Manual memory editor."""
 
     def __init__(self, store: MemoryStore, parent=None):
         super().__init__(parent)
@@ -104,7 +92,6 @@ class MemoryDialog(QDialog):
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
-        buttons.clicked.connect(lambda _: self.accept())
 
         layout = QVBoxLayout(self)
         layout.addWidget(self.list_widget)
@@ -130,11 +117,11 @@ class MemoryDialog(QDialog):
         self.store.remove(row)
         self.list_widget.takeItem(row)
 
-
 class SettingsDialog(QDialog):
-    def __init__(self, config: dict, client: OllamaClient, parent=None):
+    def __init__(self, config: dict, client: OllamaClient, conversation_mgr: ConversationManager, parent=None):
         super().__init__(parent)
         self.config = config
+        self.conversation_mgr = conversation_mgr
         self.setWindowTitle("Settings")
         self.setMinimumWidth(480)
 
@@ -148,9 +135,7 @@ class SettingsDialog(QDialog):
         model_row.addWidget(self.refresh_btn)
 
         self.sys_edit = QTextEdit()
-        self.sys_edit.setPlaceholderText(
-            "System message, e.g. 'My OS is CachyOS unless otherwise specified.'"
-        )
+        self.sys_edit.setPlaceholderText("System message, e.g. 'My OS is CachyOS unless otherwise specified.'")
         self.sys_edit.setPlainText(config["system_message"])
         self.sys_edit.setMaximumHeight(100)
 
@@ -163,6 +148,9 @@ class SettingsDialog(QDialog):
         mem_row = QHBoxLayout()
         mem_row.addWidget(self.mem_check, stretch=1)
         mem_row.addWidget(mem_manage_btn)
+
+        storage_stats = self.conversation_mgr.calculate_storage_usage()
+        self.storage_label = QLabel(f"Conversation storage: {storage_stats['formatted']} ({storage_stats['file_count']} conversations)")
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -179,12 +167,12 @@ class SettingsDialog(QDialog):
         form.addWidget(QLabel("System message:"))
         form.addWidget(self.sys_edit)
         form.addLayout(mem_row)
+        form.addWidget(self.storage_label)
         form.addWidget(buttons)
 
         self.refresh_models()
 
     def refresh_models(self):
-        # Read the URL live so refreshing picks up edits before saving.
         probe = OllamaClient(self.url_edit.text().strip())
         self.model_combo.clear()
         try:
@@ -195,7 +183,7 @@ class SettingsDialog(QDialog):
         if not models:
             self.model_combo.addItem("(no models installed)")
             return
-        for m in reversed(models):  # biggest first in the dropdown
+        for m in reversed(models):
             self.model_combo.addItem(m["name"])
         configured = self.config.get("model")
         if configured:
@@ -211,54 +199,148 @@ class SettingsDialog(QDialog):
             "memories_enabled": self.mem_check.isChecked(),
         }
 
+class ConversationListItem(QWidget):
+    """Clickable list item with a delete button."""
+
+    clicked = pyqtSignal(str)
+    deleted = pyqtSignal(str)
+
+    def __init__(self, entry: dict, parent=None):
+        super().__init__(parent)
+        self.conv_id = entry["id"]
+        self.entry = entry
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 6, 4, 6)
+        layout.setSpacing(8)
+
+        self.title_label = QLabel(entry["title"])
+        self.title_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.title_label.setStyleSheet("font-weight: bold;")
+
+        time_label = QLabel(entry["updated"][:16].replace("T", " "))
+        time_label.setStyleSheet("font-size: 11px; color: gray;")
+
+        self.msg_count = QLabel(f"{entry['message_count']} msgs")
+        self.msg_count.setStyleSheet("font-size: 10px; color: gray;")
+
+        self.delete_btn = QPushButton("🗑")
+        self.delete_btn.setFixedSize(32, 32)
+        self.delete_btn.setToolTip("Delete conversation")
+        self.delete_btn.setStyleSheet("""
+            QPushButton {
+                border: none;
+                background-color: transparent;
+                font-size: 16px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255, 0, 0, 0.1);
+            }
+        """)
+        self.delete_btn.clicked.connect(self._on_delete)
+
+        layout.addWidget(self.title_label, stretch=3)
+        layout.addWidget(time_label, stretch=1)
+        layout.addWidget(self.msg_count)
+        layout.addWidget(self.delete_btn)
+
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def _on_delete(self):
+        if QMessageBox.question(
+            self,
+            "Delete conversation?",
+            f"Are you sure you want to delete \"{self.entry['title']}\"? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            self.deleted.emit(self.conv_id)
+
+    def mousePressEvent(self, event):
+        # FIXED: Removed .source() check which doesn't exist in PyQt6
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.conv_id)
+        super().mousePressEvent(event)
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"VibeCoder v{__version__}")
-        self.resize(820, 640)
+        self.resize(1000, 720)
 
         self.config = load_config()
         self.memory_store = MemoryStore()
         self.client = OllamaClient(self.config["server_url"])
+        self.conversation_mgr = ConversationManager()
 
-        # Conversation state. System message is rebuilt per request so
-        # settings/memories take effect immediately without restart.
-        self.history: list[dict] = []      # {"role", "content"} sent to model
-        self.transcript: list[tuple] = []   # (role, text) for display
+        self.history: list[dict] = []
+        self.transcript: list[tuple] = []
         self.pending_attachments: list[str] = []
         self.ai_buffer = ""
         self.worker: ChatWorker | None = None
         self.model: str | None = None
+        self.current_conv_id: str | None = None
 
         self._build_ui()
         self._bootstrap()
-
-    # ---- UI construction -------------------------------------------
+        self._refresh_conversation_list()
+        self._load_first_conversation_or_create()
 
     def _build_ui(self):
         central = QWidget()
-        layout = QVBoxLayout(central)
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        self.settings_btn = QPushButton("Settings")
+        # Sidebar
+        sidebar = QWidget()
+        sidebar.setFixedWidth(280)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(12, 12, 12, 12)
+        sidebar_layout.setSpacing(8)
+
+        sidebar_header = QHBoxLayout()
+        sidebar_title = QLabel("Conversations")
+        sidebar_title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        new_conv_btn = QPushButton("+ New")
+        new_conv_btn.setFixedHeight(36)
+        new_conv_btn.clicked.connect(self._new_conversation)
+        sidebar_header.addWidget(sidebar_title, stretch=1)
+        sidebar_header.addWidget(new_conv_btn)
+        sidebar_layout.addLayout(sidebar_header)
+
+        self.conversation_list = QListWidget()
+        self.conversation_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.conversation_list.customContextMenuRequested.connect(self._show_context_menu)
+        sidebar_layout.addWidget(self.conversation_list, stretch=1)
+
+        storage_stats = self.conversation_mgr.calculate_storage_usage()
+        self.storage_footer = QLabel(f"Storage: {storage_stats['formatted']}")
+        self.storage_footer.setStyleSheet("font-size: 10px; color: gray; padding-top: 8px;")
+        sidebar_layout.addWidget(self.storage_footer)
+
+        # Main chat area
+        chat_panel = QWidget()
+        chat_layout = QVBoxLayout(chat_panel)
+        chat_layout.setContentsMargins(0, 0, 0, 0)
+        chat_layout.setSpacing(0)
+
+        self.settings_btn = QPushButton("Settings ⚙")
         self.settings_btn.clicked.connect(self._open_settings)
         top = QHBoxLayout()
-        top.addStretch(1)
         top.addWidget(self.settings_btn)
-        layout.addLayout(top)
+        top.addStretch(1)
+        chat_layout.addLayout(top)
 
         self.chat_view = QTextBrowser()
         self.chat_view.setOpenExternalLinks(False)
-        layout.addWidget(self.chat_view, stretch=1)
+        chat_layout.addWidget(self.chat_view, stretch=1)
 
         self.attach_label = QLabel("")
-        self.attach_label.setStyleSheet("color: gray;")
-        layout.addWidget(self.attach_label)
+        self.attach_label.setStyleSheet("color: gray; font-size: 11px;")
+        chat_layout.addWidget(self.attach_label)
 
         self.input = ChatInput()
-        self.input.setPlaceholderText(
-            "Message the model... (Enter to send, Shift+Enter for newline)"
-        )
+        self.input.setPlaceholderText("Message the model... (Enter to send, Shift+Enter for newline)")
         self.input.setFixedHeight(88)
         self.input.send_requested.connect(self._on_send_clicked)
 
@@ -279,15 +361,22 @@ class MainWindow(QMainWindow):
         bottom = QHBoxLayout()
         bottom.addWidget(self.input, stretch=1)
         bottom.addLayout(side)
-        layout.addLayout(bottom)
+        chat_layout.addLayout(bottom)
+
+        # Splitter between sidebar and chat
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(sidebar)
+        splitter.addWidget(chat_panel)
+        splitter.setStretchFactor(0, 0)  # Sidebar doesn't grow
+        splitter.setStretchFactor(1, 1)  # Chat panel grows
+        splitter.setHandleWidth(1)
+
+        main_layout.addWidget(splitter, stretch=1)
 
         self.setCentralWidget(central)
         self.statusBar().showMessage("Starting...")
 
-    # ---- Startup ---------------------------------------------------
-
     def _bootstrap(self):
-        """Resolve the model from what is actually installed."""
         try:
             installed = [m["name"] for m in self.client.list_models()]
         except requests.RequestException:
@@ -301,8 +390,6 @@ class MainWindow(QMainWindow):
         if configured and configured in installed:
             self.model = configured
         elif installed:
-            # Configured model is gone/renamed, or none was set:
-            # fall back to the smallest coder model.
             self.model = self.client.pick_default_model()
             if self.model != configured:
                 self.config["model"] = self.model
@@ -316,14 +403,147 @@ class MainWindow(QMainWindow):
             f"Connected to {self.client.server_url} | Model: {self.model}"
         )
 
-    # ---- Messaging -------------------------------------------------
+    def _refresh_conversation_list(self):
+        """Reload the conversation sidebar."""
+        self.conversation_list.clear()
+        conversations = self.conversation_mgr.list_conversations()
+        if not conversations:
+            item = QListWidgetItem("(No conversations yet)")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.conversation_list.addItem(item)
+            return
+
+        for entry in conversations:
+            widget = ConversationListItem(entry)
+            widget.clicked.connect(self._load_conversation)
+            widget.deleted.connect(self._delete_conversation)
+            item = QListWidgetItem()
+            item.setSizeHint(widget.sizeHint())
+            self.conversation_list.addItem(item)
+            self.conversation_list.setItemWidget(item, widget)
+
+    def _load_first_conversation_or_create(self):
+        """Load first existing conversation or create a new one on startup."""
+        conversations = self.conversation_mgr.list_conversations()
+        if conversations:
+            self._load_conversation(conversations[0]["id"])
+        else:
+            self._new_conversation()
+
+    def _new_conversation(self):
+        """Start a fresh conversation."""
+        if self.worker is not None:
+            QMessageBox.information(
+                self, "Busy", "Wait for the current response to finish."
+            )
+            return
+
+        if self.history:
+            self._auto_save_conversation()
+
+        self.current_conv_id = self.conversation_mgr.create_conversation()["id"]
+        self.history = []
+        self.transcript = []
+        self.ai_buffer = ""
+        self.input.clear()
+        self._render()
+        self._refresh_conversation_list()
+
+    def _load_conversation(self, conv_id: str):
+        """Load a saved conversation."""
+        if self.worker is not None:
+            QMessageBox.information(
+                self, "Busy", "Wait for the current response to finish."
+            )
+            return
+
+        conv_data = self.conversation_mgr.load_conversation(conv_id)
+        if conv_data is None:
+            self.statusBar().showMessage(f"Could not load conversation {conv_id[:8]}...")
+            return
+
+        self.current_conv_id = conv_id
+        self.history = conv_data.get("messages", [])
+        self.transcript = [(m["role"], m["content"]) for m in self.history]
+        self.ai_buffer = ""
+        self._render()
+        self.statusBar().showMessage(f"Loaded conversation: {conv_data.get('title', '')}")
+
+    def _auto_save_conversation(self):
+        """Persist current conversation to disk."""
+        if not self.current_conv_id:
+            return
+
+        if not self.history:
+            return  # Nothing to save
+
+        self.conversation_mgr.save_conversation(self.current_conv_id, self.history)
+
+        conv_data = self.conversation_mgr.load_conversation(self.current_conv_id)
+        if conv_data and conv_data.get("title") == "New Conversation" and self.history:
+            new_title = self.conversation_mgr.auto_title_conversation(
+                self.current_conv_id, self.history
+            )
+            if new_title and new_title != "New Conversation":
+                self.conversation_mgr.save_conversation(
+                    self.current_conv_id, self.history, new_title
+                )
+                self._refresh_conversation_list()
+
+        self.statusBar().showMessage(f"Saved conversation {self.current_conv_id[:8]}...", 3000)
+
+    def _delete_conversation(self, conv_id: str):
+        """Delete a conversation after confirmation."""
+        if self.conversation_mgr.delete_conversation(conv_id):
+            if self.current_conv_id == conv_id:
+                remaining = self.conversation_mgr.list_conversations()
+                if remaining:
+                    self._load_conversation(remaining[0]["id"])
+                else:
+                    self._new_conversation()
+            self._refresh_conversation_list()
+            storage_stats = self.conversation_mgr.calculate_storage_usage()
+            self.storage_footer.setText(f"Storage: {storage_stats['formatted']}")
+
+    def _show_context_menu(self, pos):
+        """Right-click menu on conversation list."""
+        item = self.conversation_list.itemAt(pos)
+        if not item:
+            return
+
+        widget = self.conversation_list.itemWidget(item)
+        if not isinstance(widget, ConversationListItem):
+            return
+
+        menu = QMenu(self)
+        rename_action = menu.addAction("Rename...")
+        delete_action = menu.addAction("Delete")
+
+        action = menu.exec(self.conversation_list.mapToGlobal(pos))
+        if action == rename_action:
+            self._rename_conversation(widget.conv_id)
+        elif action == delete_action:
+            self._delete_conversation(widget.conv_id)
+
+    def _rename_conversation(self, conv_id: str):
+        """Prompt to rename a conversation."""
+        conv_data = self.conversation_mgr.load_conversation(conv_id)
+        if not conv_data:
+            return
+
+        from PyQt6.QtWidgets import QInputDialog
+        new_title, ok = QInputDialog.getText(
+            self, "Rename Conversation", "New title:",
+            text=conv_data.get("title", "")
+        )
+        if ok and new_title.strip():
+            # FIXED: save_conversation now handles missing metadata
+            self.conversation_mgr.save_conversation(
+                conv_id, self.history, new_title.strip()
+            )
+            self._refresh_conversation_list()
 
     def _system_messages(self) -> list[dict]:
-        """Assemble the system message from config + (optional) memories.
-
-        Kept deliberately compact: raw system message plus at most
-        memory_max_chars characters of bullets. Nothing else.
-        """
         parts = []
         if self.config["system_message"].strip():
             parts.append(self.config["system_message"].strip())
@@ -339,7 +559,7 @@ class MainWindow(QMainWindow):
 
     def _on_send_clicked(self):
         if self.worker is not None:
-            return  # a stream is in flight
+            return
         if self.model is None:
             QMessageBox.warning(
                 self, "No model", "No model available. Check Settings."
@@ -348,6 +568,10 @@ class MainWindow(QMainWindow):
         text = self.input.toPlainText().strip()
         if not text and not self.pending_attachments:
             return
+
+        if not self.current_conv_id:
+            self.current_conv_id = self.conversation_mgr.create_conversation()["id"]
+            self._refresh_conversation_list()
 
         user_content = text
         attachment_ctx = self._attachment_context(self.pending_attachments)
@@ -375,8 +599,6 @@ class MainWindow(QMainWindow):
         self.worker.chunk_received.connect(self._on_chunk)
         self.worker.finished_ok.connect(self._on_done)
         self.worker.failed.connect(self._on_error)
-        # QThread.finished fires only after run() returns and the thread
-        # has wound down - the safe point to schedule release.
         self.worker.finished.connect(self.worker.deleteLater)
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.start()
@@ -402,9 +624,6 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
 
     def _on_worker_finished(self):
-        # Fires on QThread.finished. Covers the Stop-button path where
-        # neither finished_ok nor failed is emitted, and releases the
-        # worker reference now that the thread has fully stopped.
         if self.ai_buffer:
             self._finalize_assistant()
             self._render()
@@ -413,7 +632,6 @@ class MainWindow(QMainWindow):
             self.worker = None
 
     def _finalize_assistant(self):
-        # Idempotent: several end-of-stream paths may fire in sequence.
         if self.ai_buffer:
             self.history.append(
                 {"role": "assistant", "content": self.ai_buffer}
@@ -423,11 +641,11 @@ class MainWindow(QMainWindow):
                 self.transcript.pop()
         self.ai_buffer = ""
 
+        self._auto_save_conversation()
+
     def _set_busy(self, busy: bool):
         self.send_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
-
-    # ---- Attachments (scaffolding for Phase 2) ---------------------
 
     def _attach_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Attach file")
@@ -438,11 +656,6 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _attachment_context(paths: list[str]) -> str:
-        """Embed attachments as fenced text blocks in the user message.
-
-        Phase 2 will reuse this exact pipeline for project files;
-        images will switch to Ollama's multimodal message format here.
-        """
         sections = []
         for p in paths:
             try:
@@ -455,11 +668,9 @@ class MainWindow(QMainWindow):
             lang = Path(p).suffix.lstrip(".")
             sections.append(
                 f"Attached file: `{Path(p).name}`\n\n"
-                f"```{lang}\n{content}\n```"
+                f"```{lang}\n{content}\n```\n"
             )
         return "\n\n".join(sections)
-
-    # ---- Rendering -------------------------------------------------
 
     def _render(self):
         parts = []
@@ -474,15 +685,13 @@ class MainWindow(QMainWindow):
         scrollbar = self.chat_view.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    # ---- Settings --------------------------------------------------
-
     def _open_settings(self):
         if self.worker is not None:
             QMessageBox.information(
                 self, "Busy", "Wait for the current response to finish."
             )
             return
-        dialog = SettingsDialog(self.config, self.client, self)
+        dialog = SettingsDialog(self.config, self.client, self.conversation_mgr, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         values = dialog.values()
