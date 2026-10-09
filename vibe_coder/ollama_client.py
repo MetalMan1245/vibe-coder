@@ -104,6 +104,33 @@ class OllamaClient:
         finally:
             self._response = None
 
+    def complete(self, model: str, messages: list) -> str:
+        """Non-streaming chat completion; returns the full reply text."""
+        self._aborted = False
+        messages = self._sanitize_messages(messages)
+        if not messages:
+            raise ValueError("No valid messages to send to Ollama")
+        payload = {"model": model, "messages": messages, "stream": False}
+        resp = requests.post(
+            f"{self.server_url}/api/chat",
+            json=payload,
+            timeout=(5, None),
+        )
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            try:
+                err_body = resp.text
+            except Exception:
+                err_body = ""
+            if err_body:
+                raise RuntimeError(f"Ollama API error: {err_body}") from exc
+            raise
+        data = resp.json()
+        if "error" in data:
+            raise RuntimeError(data["error"])
+        return data.get("message", {}).get("content", "")
+
     def abort(self) -> None:
         """Cancel an in-flight chat (called from the GUI on Stop)."""
         self._aborted = True

@@ -8,12 +8,12 @@ from pathlib import Path
 import requests
 import os, sys
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QTextCursor, QFont, QMouseEvent
+from PyQt6.QtGui import QTextCursor, QFont, QMouseEvent, QTextOption
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QTextBrowser, QTextEdit,
-    QVBoxLayout, QWidget, QSplitter, QMenu
+    QVBoxLayout, QWidget, QSplitter, QMenu, QStyle
 )
 
 from vibe_coder import __version__
@@ -49,6 +49,43 @@ class ChatWorker(QThread):
         except Exception as exc:
             if not self._client.aborted:
                 self.failed.emit(str(exc))
+
+
+class TitleWorker(QThread):
+    """Generates a short conversation title in the background."""
+
+    title_ready = pyqtSignal(str, str)  # conv_id, title
+    failed = pyqtSignal(str)
+
+    def __init__(self, client: OllamaClient, model: str, conv_id: str,
+                 messages: list):
+        super().__init__()
+        self._client = client
+        self._model = model
+        self._conv_id = conv_id
+        self._messages = messages
+
+    def run(self):
+        try:
+            excerpt = "\n".join(
+                f"{m['role']}: {m['content'][:400]}" for m in self._messages[:2]
+            )
+            prompt = (
+                "Write a short title for this conversation, at most 30 "
+                "characters. Reply with the title only, no quotes.\n\n"
+                f"{excerpt}"
+            )
+            title = self._client.complete(
+                self._model, [{"role": "user", "content": prompt}]
+            )
+            title = title.strip().strip('"').strip("'").splitlines()[0].strip()
+            if not title:
+                raise ValueError("empty title")
+            if len(title) > 30:
+                title = title[:30].rstrip()
+            self.title_ready.emit(self._conv_id, title)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 class ChatInput(QTextEdit):
     """Multi-line input. Enter sends, Shift+Enter inserts a newline."""
@@ -200,12 +237,12 @@ class SettingsDialog(QDialog):
         }
 
 class ConversationListItem(QWidget):
-    """Clickable list item with a delete button."""
+    """Clickable list item with a delete button and copy/delete context menu."""
 
     clicked = pyqtSignal(str)
     deleted = pyqtSignal(str)
 
-    def __init__(self, entry: dict, parent=None):
+    def __init__(self, entry: dict, max_title_width: int = 170, parent=None):
         super().__init__(parent)
         self.conv_id = entry["id"]
         self.entry = entry
@@ -214,39 +251,49 @@ class ConversationListItem(QWidget):
         layout.setContentsMargins(8, 6, 4, 6)
         layout.setSpacing(8)
 
-        self.title_label = QLabel(entry["title"])
-        self.title_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        text_column = QVBoxLayout()
+        text_column.setSpacing(0)
+
+        self.title_label = QLabel()
+        metrics = self.title_label.fontMetrics()
+        self.title_label.setText(metrics.elidedText(
+            entry["title"], Qt.TextElideMode.ElideRight, max_title_width
+        ))
         self.title_label.setStyleSheet("font-weight: bold;")
 
         time_label = QLabel(entry["updated"][:16].replace("T", " "))
         time_label.setStyleSheet("font-size: 11px; color: gray;")
 
-        self.msg_count = QLabel(f"{entry['message_count']} msgs")
-        self.msg_count.setStyleSheet("font-size: 10px; color: gray;")
+        msg_count = QLabel(f"{entry['message_count']} msgs")
+        msg_count.setStyleSheet("font-size: 10px; color: gray;")
 
-        self.delete_btn = QPushButton("🗑")
-        self.delete_btn.setFixedSize(32, 32)
+        meta_row = QHBoxLayout()
+        meta_row.addWidget(time_label)
+        meta_row.addWidget(msg_count)
+        meta_row.addStretch(1)
+
+        text_column.addWidget(self.title_label)
+        text_column.addLayout(meta_row)
+
+        self.delete_btn = QPushButton()
+        self.delete_btn.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
+        )
+        self.delete_btn.setFixedSize(28, 28)
         self.delete_btn.setToolTip("Delete conversation")
-        self.delete_btn.setStyleSheet("""
-            QPushButton {
-                border: none;
-                background-color: transparent;
-                font-size: 16px;
-            }
-            QPushButton:hover {
-                background-color: rgba(255, 0, 0, 0.1);
-            }
-        """)
-        self.delete_btn.clicked.connect(self._on_delete)
+        self.delete_btn.setStyleSheet(
+            "QPushButton { border: none; background-color: transparent; }"
+            "QPushButton:hover { background-color: rgba(255, 0, 0, 0.15);"
+            " border-radius: 4px; }"
+        )
+        self.delete_btn.clicked.connect(self._confirm_delete)
 
-        layout.addWidget(self.title_label, stretch=3)
-        layout.addWidget(time_label, stretch=1)
-        layout.addWidget(self.msg_count)
-        layout.addWidget(self.delete_btn)
+        layout.addLayout(text_column, stretch=1)
+        layout.addWidget(self.delete_btn, 0, Qt.AlignmentFlag.AlignTop)
 
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-    def _on_delete(self):
+    def _confirm_delete(self):
         if QMessageBox.question(
             self,
             "Delete conversation?",
@@ -256,10 +303,19 @@ class ConversationListItem(QWidget):
             self.deleted.emit(self.conv_id)
 
     def mousePressEvent(self, event):
-        # FIXED: Removed .source() check which doesn't exist in PyQt6
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit(self.conv_id)
         super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+        copy_action = menu.addAction("Copy")
+        delete_action = menu.addAction("Delete")
+        action = menu.exec(event.globalPos())
+        if action == copy_action:
+            QApplication.clipboard().setText(self.entry["title"])
+        elif action == delete_action:
+            self._confirm_delete()
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -277,8 +333,11 @@ class MainWindow(QMainWindow):
         self.pending_attachments: list[str] = []
         self.ai_buffer = ""
         self.worker: ChatWorker | None = None
+        self.title_worker: TitleWorker | None = None
         self.model: str | None = None
         self.current_conv_id: str | None = None
+
+        self.setAcceptDrops(True)
 
         self._build_ui()
         self._bootstrap()
@@ -309,8 +368,6 @@ class MainWindow(QMainWindow):
         sidebar_layout.addLayout(sidebar_header)
 
         self.conversation_list = QListWidget()
-        self.conversation_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.conversation_list.customContextMenuRequested.connect(self._show_context_menu)
         sidebar_layout.addWidget(self.conversation_list, stretch=1)
 
         storage_stats = self.conversation_mgr.calculate_storage_usage()
@@ -333,6 +390,8 @@ class MainWindow(QMainWindow):
 
         self.chat_view = QTextBrowser()
         self.chat_view.setOpenExternalLinks(False)
+        self.chat_view.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        self.chat_view.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
         chat_layout.addWidget(self.chat_view, stretch=1)
 
         self.attach_label = QLabel("")
@@ -413,8 +472,9 @@ class MainWindow(QMainWindow):
             self.conversation_list.addItem(item)
             return
 
+        title_width = max(self.conversation_list.width() - 70, 100)
         for entry in conversations:
-            widget = ConversationListItem(entry)
+            widget = ConversationListItem(entry, max_title_width=title_width)
             widget.clicked.connect(self._load_conversation)
             widget.deleted.connect(self._delete_conversation)
             item = QListWidgetItem()
@@ -480,15 +540,8 @@ class MainWindow(QMainWindow):
         self.conversation_mgr.save_conversation(self.current_conv_id, self.history)
 
         conv_data = self.conversation_mgr.load_conversation(self.current_conv_id)
-        if conv_data and conv_data.get("title") == "New Conversation" and self.history:
-            new_title = self.conversation_mgr.auto_title_conversation(
-                self.current_conv_id, self.history
-            )
-            if new_title and new_title != "New Conversation":
-                self.conversation_mgr.save_conversation(
-                    self.current_conv_id, self.history, new_title
-                )
-                self._refresh_conversation_list()
+        if conv_data and conv_data.get("title") == "New Conversation":
+            self._request_ai_title(self.current_conv_id)
 
         self.statusBar().showMessage(f"Saved conversation {self.current_conv_id[:8]}...", 3000)
 
@@ -505,43 +558,57 @@ class MainWindow(QMainWindow):
             storage_stats = self.conversation_mgr.calculate_storage_usage()
             self.storage_footer.setText(f"Storage: {storage_stats['formatted']}")
 
-    def _show_context_menu(self, pos):
-        """Right-click menu on conversation list."""
-        item = self.conversation_list.itemAt(pos)
-        if not item:
+    def _request_ai_title(self, conv_id: str):
+        """Ask the model for a short (~30 char) conversation title."""
+        if self.title_worker is not None or self.model is None:
             return
-
-        widget = self.conversation_list.itemWidget(item)
-        if not isinstance(widget, ConversationListItem):
+        if not self.current_conv_id or len(self.history) < 2:
             return
+        worker = TitleWorker(self.client, self.model, conv_id, self.history)
+        worker.title_ready.connect(self._on_title_ready)
+        worker.failed.connect(self._on_title_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.finished.connect(self._on_title_worker_finished)
+        self.title_worker = worker
+        worker.start()
 
-        menu = QMenu(self)
-        rename_action = menu.addAction("Rename...")
-        delete_action = menu.addAction("Delete")
-
-        action = menu.exec(self.conversation_list.mapToGlobal(pos))
-        if action == rename_action:
-            self._rename_conversation(widget.conv_id)
-        elif action == delete_action:
-            self._delete_conversation(widget.conv_id)
-
-    def _rename_conversation(self, conv_id: str):
-        """Prompt to rename a conversation."""
-        conv_data = self.conversation_mgr.load_conversation(conv_id)
-        if not conv_data:
-            return
-
-        from PyQt6.QtWidgets import QInputDialog
-        new_title, ok = QInputDialog.getText(
-            self, "Rename Conversation", "New title:",
-            text=conv_data.get("title", "")
-        )
-        if ok and new_title.strip():
-            # FIXED: save_conversation now handles missing metadata
+    def _on_title_ready(self, conv_id: str, title: str):
+        conv = self.conversation_mgr.load_conversation(conv_id)
+        if conv:
             self.conversation_mgr.save_conversation(
-                conv_id, self.history, new_title.strip()
+                conv_id, conv.get("messages", []), title
             )
             self._refresh_conversation_list()
+
+    def _on_title_failed(self, message: str):
+        self.statusBar().showMessage(
+            f"Title generation failed: {message}", 5000
+        )
+        if self.current_conv_id:
+            fallback = self.conversation_mgr.auto_title_conversation(
+                self.current_conv_id, self.history
+            )
+            if fallback and fallback != "New Conversation":
+                self._on_title_ready(self.current_conv_id, fallback)
+
+    def _on_title_worker_finished(self):
+        if self.sender() is self.title_worker:
+            self.title_worker = None
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        added = False
+        for url in event.mimeData().urls():
+            if url.isLocalFile():
+                self.pending_attachments.append(url.toLocalFile())
+                added = True
+        if added:
+            names = ", ".join(Path(p).name for p in self.pending_attachments)
+            self.attach_label.setText(f"Attached: {names}")
+        event.acceptProposedAction()
 
     def _system_messages(self) -> list[dict]:
         parts = []
