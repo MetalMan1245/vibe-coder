@@ -177,6 +177,19 @@ class ConversationManager:
             "file_count": file_count,
         }
 
+    def get_conversation_size(self, conv_id: str) -> str:
+        """Return a human-readable size for a single conversation file."""
+        path = self._get_file_path(conv_id)
+        try:
+            size_bytes = path.stat().st_size
+        except OSError:
+            return "0 B"
+        if size_bytes >= 1_000_000:
+            return f"{size_bytes / 1_000_000:.1f} MB"
+        if size_bytes >= 1_000:
+            return f"{size_bytes / 1_000:.1f} KB"
+        return f"{size_bytes} B"
+
     def auto_title_conversation(self, conv_id: str, messages: list[dict]) -> str:
         """Generate a title from the first user message (truncated)."""
         user_messages = [m for m in messages if m.get("role") == "user"]

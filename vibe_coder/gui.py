@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QTextBrowser, QTextEdit,
-    QVBoxLayout, QWidget, QSplitter, QMenu, QStyle
+    QVBoxLayout, QWidget, QSplitter, QMenu, QStyle, QInputDialog
 )
 
 from vibe_coder import __version__
@@ -71,8 +71,13 @@ class TitleWorker(QThread):
                 f"{m['role']}: {m['content'][:400]}" for m in self._messages[:2]
             )
             prompt = (
-                "Write a short title for this conversation, at most 30 "
-                "characters. Reply with the title only, no quotes.\n\n"
+                "Give this conversation a concise title.\n"
+                "Rules:\n"
+                "- Exactly 2 to 4 words\n"
+                "- No more than 28 characters total\n"
+                "- Lowercase except proper nouns\n"
+                "- No quotes, no ending punctuation, no emoji\n"
+                "Reply with only the title.\n\n"
                 f"{excerpt}"
             )
             title = self._client.complete(
@@ -81,8 +86,8 @@ class TitleWorker(QThread):
             title = title.strip().strip('"').strip("'").splitlines()[0].strip()
             if not title:
                 raise ValueError("empty title")
-            if len(title) > 30:
-                title = title[:30].rstrip()
+            if len(title) > 40:
+                title = title[:40].rsplit(" ", 1)[0]
             self.title_ready.emit(self._conv_id, title)
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -241,8 +246,10 @@ class ConversationListItem(QWidget):
 
     clicked = pyqtSignal(str)
     deleted = pyqtSignal(str)
+    rename_requested = pyqtSignal(str)
 
-    def __init__(self, entry: dict, max_title_width: int = 170, parent=None):
+    def __init__(self, entry: dict, max_title_width: int = 170,
+                 size_text: str = "", parent=None):
         super().__init__(parent)
         self.conv_id = entry["id"]
         self.entry = entry
@@ -264,7 +271,10 @@ class ConversationListItem(QWidget):
         time_label = QLabel(entry["updated"][:16].replace("T", " "))
         time_label.setStyleSheet("font-size: 11px; color: gray;")
 
-        msg_count = QLabel(f"{entry['message_count']} msgs")
+        meta_text = f"{entry['message_count']} msgs"
+        if size_text:
+            meta_text += f" · {size_text}"
+        msg_count = QLabel(meta_text)
         msg_count.setStyleSheet("font-size: 10px; color: gray;")
 
         meta_row = QHBoxLayout()
@@ -309,10 +319,13 @@ class ConversationListItem(QWidget):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
+        rename_action = menu.addAction("Rename...")
         copy_action = menu.addAction("Copy")
         delete_action = menu.addAction("Delete")
         action = menu.exec(event.globalPos())
-        if action == copy_action:
+        if action == rename_action:
+            self.rename_requested.emit(self.conv_id)
+        elif action == copy_action:
             QApplication.clipboard().setText(self.entry["title"])
         elif action == delete_action:
             self._confirm_delete()
@@ -391,7 +404,7 @@ class MainWindow(QMainWindow):
         self.chat_view = QTextBrowser()
         self.chat_view.setOpenExternalLinks(False)
         self.chat_view.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        self.chat_view.setWordWrapMode(QTextOption.WrapMode.WrapAnywhere)
+        self.chat_view.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         chat_layout.addWidget(self.chat_view, stretch=1)
 
         self.attach_label = QLabel("")
@@ -474,9 +487,13 @@ class MainWindow(QMainWindow):
 
         title_width = max(self.conversation_list.width() - 70, 100)
         for entry in conversations:
-            widget = ConversationListItem(entry, max_title_width=title_width)
+            size_text = self.conversation_mgr.get_conversation_size(entry["id"])
+            widget = ConversationListItem(
+                entry, max_title_width=title_width, size_text=size_text
+            )
             widget.clicked.connect(self._load_conversation)
             widget.deleted.connect(self._delete_conversation)
+            widget.rename_requested.connect(self._rename_conversation)
             item = QListWidgetItem()
             item.setSizeHint(widget.sizeHint())
             self.conversation_list.addItem(item)
@@ -594,6 +611,22 @@ class MainWindow(QMainWindow):
     def _on_title_worker_finished(self):
         if self.sender() is self.title_worker:
             self.title_worker = None
+
+    def _rename_conversation(self, conv_id: str):
+        """Prompt to rename a conversation."""
+        conv_data = self.conversation_mgr.load_conversation(conv_id)
+        if not conv_data:
+            return
+        new_title, ok = QInputDialog.getText(
+            self, "Rename Conversation", "New title:",
+            text=conv_data.get("title", "")
+        )
+        if ok and new_title.strip():
+            self.conversation_mgr.save_conversation(
+                conv_id, conv_data.get("messages", []),
+                new_title.strip()
+            )
+            self._refresh_conversation_list()
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -748,9 +781,15 @@ class MainWindow(QMainWindow):
                 parts.append(f"*{text}*")
             else:
                 parts.append(f"**{label}**\n\n{text}")
+        scrollbar = self.chat_view.verticalScrollBar()
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+        old_position = scrollbar.value()
         self.chat_view.setMarkdown("\n\n---\n\n".join(parts))
         scrollbar = self.chat_view.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        if at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
+        else:
+            scrollbar.setValue(min(old_position, scrollbar.maximum()))
 
     def _open_settings(self):
         if self.worker is not None:
