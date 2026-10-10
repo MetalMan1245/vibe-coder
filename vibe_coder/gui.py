@@ -4,6 +4,8 @@ Phase 2 adds conversation persistence, switching, and deletion.
 """
 
 from pathlib import Path
+import re
+import subprocess
 
 import requests
 import os, sys
@@ -89,6 +91,68 @@ class TitleWorker(QThread):
             if len(title) > 40:
                 title = title[:40].rsplit(" ", 1)[0]
             self.title_ready.emit(self._conv_id, title)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+class ToolExecutionWorker(QThread):
+    """Handles tool execution loop with tool support."""
+
+    content_reset = pyqtSignal()          # new iteration: clear display buffer
+    content_chunk = pyqtSignal(str)      # complete content for this iteration
+    tool_executed = pyqtSignal(str)       # one-line tool log
+    thinking = pyqtSignal(bool)           # request in flight indicator
+    finished_all = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, client: OllamaClient, model: str, messages: list,
+                 tools: list[dict], tool_executor_func):
+        super().__init__()
+        self._client = client
+        self._model = model
+        self._messages = messages
+        self._tools = tools
+        self._execute_tool = tool_executor_func
+        self._aborted = False
+        self._max_tool_iterations = 30
+
+    def run(self):
+        messages = list(self._messages)
+        iteration = 0
+
+        try:
+            while iteration < self._max_tool_iterations:
+                iteration += 1
+
+                self.thinking.emit(True)
+                content, tool_calls, message = self._client.complete_with_tools(
+                    self._model, messages, self._tools
+                )
+                self.thinking.emit(False)
+
+                # Append the FULL assistant message (tool_calls included)
+                # so later iterations can see what was previously called.
+                messages.append(message)
+
+                if content:
+                    self.content_reset.emit()
+                    self.content_chunk.emit(content)
+
+                if not tool_calls:
+                    break
+
+                for tc in tool_calls:
+                    result = self._execute_tool(tc)
+                    first_line = result.splitlines()[0] if result else ""
+                    self.tool_executed.emit(
+                        f"→ {tc['name']}: {first_line[:160]}"
+                    )
+                    messages.append({
+                        "role": "tool",
+                        "tool_name": tc["name"],
+                        "content": result,
+                    })
+
+            self.finished_all.emit()
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -340,6 +404,8 @@ class MainWindow(QMainWindow):
         self.memory_store = MemoryStore()
         self.client = OllamaClient(self.config["server_url"])
         self.conversation_mgr = ConversationManager()
+        from vibe_coder.project_manager import ProjectManager
+        self.project_mgr = ProjectManager()
 
         self.history: list[dict] = []
         self.transcript: list[tuple] = []
@@ -349,6 +415,8 @@ class MainWindow(QMainWindow):
         self.title_worker: TitleWorker | None = None
         self.model: str | None = None
         self.current_conv_id: str | None = None
+        self.current_project_id: str | None = None
+        self.files_cache: list[str] = []
 
         self.setAcceptDrops(True)
 
@@ -356,6 +424,8 @@ class MainWindow(QMainWindow):
         self._bootstrap()
         self._refresh_conversation_list()
         self._load_first_conversation_or_create()
+        self._refresh_project_list()
+        self._check_first_project_warning()
 
     def _build_ui(self):
         central = QWidget()
@@ -363,30 +433,97 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Sidebar
+        # Main split: sidebar (tabs) + content
         sidebar = QWidget()
         sidebar.setFixedWidth(280)
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(12, 12, 12, 12)
-        sidebar_layout.setSpacing(8)
+        sidebar_layout.setSpacing(6)
 
-        sidebar_header = QHBoxLayout()
-        sidebar_title = QLabel("Conversations")
-        sidebar_title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        # Tab buttons
+        tab_buttons = QHBoxLayout()
+        self.conversations_tab_btn = QPushButton("Conversations")
+        self.projects_tab_btn = QPushButton("Projects")
+        self.conversations_tab_btn.setCheckable(True)
+        self.projects_tab_btn.setCheckable(True)
+        self.conversations_tab_btn.setChecked(True)
+        self.conversations_tab_btn.clicked.connect(self._switch_to_conversations)
+        self.projects_tab_btn.clicked.connect(self._switch_to_projects)
+        tab_buttons.addWidget(self.conversations_tab_btn)
+        tab_buttons.addWidget(self.projects_tab_btn)
+        sidebar_layout.addLayout(tab_buttons)
+
+        sidebar_layout.addWidget(QLabel(""))  # spacer
+
+        # Conversations section
+        self.conversations_section = QWidget()
+        conv_layout = QVBoxLayout(self.conversations_section)
+        conv_layout.setContentsMargins(0, 0, 0, 0)
+        conv_layout.setSpacing(8)
+
+        conv_header = QHBoxLayout()
+        conv_title = QLabel("Conversations")
+        conv_title.setStyleSheet("font-size: 14px; font-weight: bold;")
         new_conv_btn = QPushButton("+ New")
-        new_conv_btn.setFixedHeight(36)
+        new_conv_btn.setFixedHeight(30)
         new_conv_btn.clicked.connect(self._new_conversation)
-        sidebar_header.addWidget(sidebar_title, stretch=1)
-        sidebar_header.addWidget(new_conv_btn)
-        sidebar_layout.addLayout(sidebar_header)
+        conv_header.addWidget(conv_title, stretch=1)
+        conv_header.addWidget(new_conv_btn)
+        conv_layout.addLayout(conv_header)
 
         self.conversation_list = QListWidget()
-        sidebar_layout.addWidget(self.conversation_list, stretch=1)
+        conv_layout.addWidget(self.conversation_list, stretch=1)
 
         storage_stats = self.conversation_mgr.calculate_storage_usage()
         self.storage_footer = QLabel(f"Storage: {storage_stats['formatted']}")
-        self.storage_footer.setStyleSheet("font-size: 10px; color: gray; padding-top: 8px;")
-        sidebar_layout.addWidget(self.storage_footer)
+        self.storage_footer.setStyleSheet("font-size: 10px; color: gray;")
+        conv_layout.addWidget(self.storage_footer)
+
+        sidebar_layout.addWidget(self.conversations_section, stretch=1)
+
+        # Projects section (hidden initially)
+        self.projects_section = QWidget()
+        proj_layout = QVBoxLayout(self.projects_section)
+        proj_layout.setContentsMargins(0, 0, 0, 0)
+        proj_layout.setSpacing(8)
+
+        proj_header = QHBoxLayout()
+        proj_title = QLabel("Projects")
+        proj_title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        new_proj_btn = QPushButton("+ New")
+        new_proj_btn.setFixedHeight(30)
+        new_proj_btn.clicked.connect(self._new_project)
+        proj_header.addWidget(proj_title, stretch=1)
+        proj_header.addWidget(new_proj_btn)
+        proj_layout.addLayout(proj_header)
+
+        self.project_list = QListWidget()
+        self.project_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.project_list.customContextMenuRequested.connect(self._show_project_context_menu)
+        self.project_list.itemSelectionChanged.connect(self._on_project_selected)
+        proj_layout.addWidget(self.project_list, stretch=1)
+
+        # Files in project (sub-list)
+        self.files_list = QListWidget()
+        self.files_list.itemDoubleClicked.connect(self._view_file)
+        files_header = QLabel("Files")
+        files_header.setStyleSheet("font-size: 12px; font-weight: bold; padding-top: 8px;")
+        proj_layout.addWidget(files_header)
+        proj_layout.addWidget(self.files_list, stretch=1)
+
+        proj_footer = QHBoxLayout()
+        self.git_status_label = QLabel("Git: -")
+        self.git_status_label.setStyleSheet("font-size: 10px; color: gray;")
+        self.refresh_git_btn = QPushButton("⟳")
+        self.refresh_git_btn.setFixedSize(24, 24)
+        self.refresh_git_btn.setToolTip("Refresh git status")
+        self.refresh_git_btn.clicked.connect(self._refresh_git_status)
+        proj_footer.addWidget(self.git_status_label)
+        proj_footer.addWidget(self.refresh_git_btn)
+        proj_layout.addLayout(proj_footer)
+
+        sidebar_layout.addWidget(self.projects_section)
+        self.projects_section.setVisible(False)  # Hidden until switched
 
         # Main chat area
         chat_panel = QWidget()
@@ -406,6 +543,14 @@ class MainWindow(QMainWindow):
         self.chat_view.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self.chat_view.setWordWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
         chat_layout.addWidget(self.chat_view, stretch=1)
+
+        # File viewer (shown when project active)
+        self.file_viewer = QTextBrowser()
+        self.file_viewer.setOpenExternalLinks(False)
+        self.file_viewer.setPlaceholderText("Select a file from the sidebar to view")
+        self.file_viewer.setVisible(False)
+        chat_layout.addWidget(self.file_viewer, stretch=0)
+        self.file_viewer.setFixedHeight(200)
 
         self.attach_label = QLabel("")
         self.attach_label.setStyleSheet("color: gray; font-size: 11px;")
@@ -499,6 +644,17 @@ class MainWindow(QMainWindow):
             self.conversation_list.addItem(item)
             self.conversation_list.setItemWidget(item, widget)
 
+    def _switch_to_conversations(self):
+        self.conversations_section.setVisible(True)
+        self.projects_section.setVisible(False)
+        self.conversations_tab_btn.setChecked(True)
+
+    def _switch_to_projects(self):
+        self.conversations_section.setVisible(False)
+        self.projects_section.setVisible(True)
+        self.projects_tab_btn.setChecked(True)
+        self._refresh_project_list()
+
     def _load_first_conversation_or_create(self):
         """Load first existing conversation or create a new one on startup."""
         conversations = self.conversation_mgr.list_conversations()
@@ -562,6 +718,322 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(f"Saved conversation {self.current_conv_id[:8]}...", 3000)
 
+    def _on_project_selected(self):
+        """Handle project list selection change."""
+        selected = self.project_list.selectedItems()
+        if not selected:
+            # Deselect case - clear files list but keep project as "active"
+            self.files_list.clear()
+            self.files_cache = []
+            self.file_viewer.setVisible(False)
+            return
+
+        proj_id = selected[0].data(Qt.ItemDataRole.UserRole)
+        if proj_id:
+            self._load_project_by_id(proj_id)
+            self._populate_files_list(proj_id)  # Always populate when selected
+
+    def _get_tool_definitions(self) -> list[dict]:
+        """Return tool definitions for the AI if a project is active."""
+        if not self.current_project_id:
+            return []
+
+        proj_data = self.project_mgr.load_project(self.current_project_id)
+        if not proj_data:
+            return []
+
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read the content of a file within the project scope.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Relative path to the file within the project."
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Create or overwrite a file within the project scope. Automatically commits changes after writing.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Relative path to the file within the project."
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "The content to write to the file."
+                            }
+                        },
+                        "required": ["path", "content"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "list_files",
+                    "description": "List files in the project scope. Use recursive=false for root directory only.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "recursive": {
+                                "type": "boolean",
+                                "description": "Whether to list files recursively. Default true.",
+                                "default": True
+                            }
+                        }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "delete_file",
+                    "description": "Delete a file within the project scope.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Relative path to the file within the project."
+                            }
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "git_commit",
+                    "description": "Stage and commit all changes with the given message.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message": {
+                                "type": "string",
+                                "description": "Commit message describing the changes."
+                            }
+                        },
+                        "required": ["message"]
+                    }
+                }
+            },
+        ]
+
+    def _execute_tool_call(self, tool: dict) -> str:
+        """Execute a tool call and return the result."""
+        name = tool.get("name", "")
+        args = tool.get("arguments", {})
+
+        try:
+            if name == "read_file":
+                path = args.get("path", "")
+                content = self.project_mgr.read_file(self.current_project_id, path)
+                if content is None:
+                    return f"[Error: Could not read file {path}]"
+                if len(content) > 20000:
+                    content = content[:20000] + "\n\n[...file truncated...]"
+                return f"[File content of {path}]\n{content}"
+
+            elif name == "write_file":
+                path = args.get("path", "")
+                content = args.get("content", "")
+                success = self.project_mgr.write_file(self.current_project_id, path, content)
+                if success:
+                    commit_result = self.project_mgr.git_commit(
+                        self.current_project_id, f"Update {path}"
+                    )
+                    return f"[Successfully wrote to {path}]\n[Git commit: {'success' if commit_result[0] else 'failed'}]"
+                return f"[Error: Failed to write file {path}]"
+
+            elif name == "list_files":
+                recursive = args.get("recursive", True)
+                files = self.project_mgr.list_files(self.current_project_id, recursive)
+                if len(files) > 100:
+                    files = files[:100] + [f"... ({len(files) - 100} more files)"]
+                return "[Project files]\n" + "\n".join(files)
+
+            elif name == "delete_file":
+                path = args.get("path", "")
+                success = self.project_mgr.delete_file(self.current_project_id, path)
+                if success:
+                    return f"[Successfully deleted {path}]"
+                return f"[Error: Failed to delete {path}]"
+
+            elif name == "git_commit":
+                message = args.get("message", "Auto-committed")
+                success, output = self.project_mgr.git_commit(self.current_project_id, message)
+                if success:
+                    return f"[Successfully committed: {message}]"
+                return f"[Error: Commit failed - {output}]"
+
+            else:
+                return f"[Error: Unknown tool '{name}']"
+        except Exception as exc:
+            return f"[Error executing tool {name}: {exc}]"
+
+    def _view_file(self, item):
+        """View file contents in the file viewer panel."""
+        rel_path = item.text()
+        if not self.current_project_id:
+            return
+
+        content = self.project_mgr.read_file(self.current_project_id, rel_path)
+        if content is None:
+            self.file_viewer.setPlainText(f"[Could not read file: {rel_path}]")
+            return
+
+        # Detect language for syntax hinting
+        ext = Path(rel_path).suffix.lower()
+        lang_map = {
+            ".py": "python", ".js": "javascript", ".html": "html",
+            ".css": "css", ".json": "json", ".md": "markdown",
+            ".sh": "bash", ".yaml": "yaml", ".yml": "yaml",
+            ".txt": "", ".toml": "", ".ini": "",
+        }
+        lang = lang_map.get(ext, "")
+
+        preview = f"**File:** `{rel_path}`\n\n"
+        if lang:
+            preview += f"\n```{lang}\n{content}\n```\n"
+        else:
+            preview += f"\n```\n{content}\n```\n"
+
+        self.file_viewer.setHtml(CHAT_STYLESHEET + preview)
+        self.file_viewer.setVisible(True)
+
+    def _check_first_project_warning(self):
+        """Warn user about AI file modifications on first project."""
+        if self.project_mgr.first_project_warning_shown:
+            return
+        projects = self.project_mgr.list_projects()
+        if not projects:
+            # No projects yet, show warning on next project creation
+            return
+
+        QMessageBox.warning(
+            self,
+            "Project File Modifications",
+            "AI will modify files directly in this project without asking.\n\n"
+            "⚠️ IMPORTANT: Back up your project folder regularly!\n\n"
+            "The AI can create, edit, and delete files freely. "
+            "Always review changes before pushing to remote.",
+            QMessageBox.StandardButton.Ok
+        )
+        self.project_mgr.first_project_warning_shown = True
+
+    def _new_project(self):
+        """Create a new project with user-specified scope."""
+        if self.worker is not None:
+            QMessageBox.information(
+                self, "Busy", "Wait for the current response to finish."
+            )
+            return
+
+        name, ok = QInputDialog.getText(self, "New Project", "Project name:")
+        if not ok or not name.strip():
+            return
+
+        # Choose scope directory
+        scope_path = Path(QFileDialog.getExistingDirectory(
+            self, "Select Project Scope Directory"
+        ))
+        if not scope_path:
+            return
+
+        try:
+            self.current_project_id = self.project_mgr.create_project(name.strip(), scope_path)
+            QMessageBox.information(
+                self, "Project Created",
+                f"Project '{name}' created at {scope_path}\n\n"
+                "The AI will only access files within this directory."
+            )
+            self._refresh_project_list()
+            self._switch_to_projects()
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"Failed to create project: {exc}")
+
+    def _refresh_project_list(self):
+        """Reload the project list."""
+        self.project_list.clear()
+        self.files_list.clear()
+        self.files_cache = []
+        self.file_viewer.setVisible(False)
+
+        projects = self.project_mgr.list_projects()
+        if not projects:
+            item = QListWidgetItem("(No projects yet)")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.project_list.addItem(item)
+            return
+
+        for entry in projects:
+            item = QListWidgetItem(entry["name"])
+            item.setToolTip(f"Scope: {entry['scope_path']}\nCreated: {entry['created'][:10]}")
+            item.setData(Qt.ItemDataRole.UserRole, entry["id"])
+            self.project_list.addItem(item)
+
+        # Select active project if any
+        if self.current_project_id:
+            for i in range(self.project_list.count()):
+                if self.project_list.item(i).data(Qt.ItemDataRole.UserRole) == self.current_project_id:
+                    self.project_list.setCurrentItem(self.project_list.item(i))
+                    self._populate_files_list(self.current_project_id)
+                    break
+
+    def _populate_files_list(self, proj_id: str):
+        """Populate the files list for a project."""
+        self.files_cache = self.project_mgr.list_files(proj_id)
+        self.files_list.clear()
+        for rel_path in self.files_cache[:50]:  # Limit display
+            item = QListWidgetItem(rel_path)
+            item.setData(Qt.ItemDataRole.UserRole, rel_path)
+            self.files_list.addItem(item)
+        if len(self.files_cache) > 50:
+            item = QListWidgetItem(f"... and {len(self.files_cache) - 50} more")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.files_list.addItem(item)
+
+    def _refresh_git_status(self):
+        """Refresh git status display."""
+        if not self.current_project_id:
+            self.git_status_label.setText("Git: No project")
+            return
+
+        status = self.project_mgr.git_status(self.current_project_id)
+        if status.strip() == "":
+            self.git_status_label.setText("Git: Clean")
+        elif "nothing to commit" in status.lower():
+            self.git_status_label.setText("Git: Clean")
+        else:
+            changes = len([l for l in status.split("\n") if l.strip()])
+            self.git_status_label.setText(f"Git: {changes} change(s)")
+
+    def _load_project_by_id(self, proj_id: str):
+        """Load a project by ID."""
+        proj_data = self.project_mgr.load_project(proj_id)
+        if not proj_data:
+            return
+
+        self.current_project_id = proj_id
+        self.files_cache = self.project_mgr.list_files(proj_id)
+        self._refresh_git_status()
+        self.statusBar().showMessage(f"Active project: {proj_data['name']}")
+
     def _delete_conversation(self, conv_id: str):
         """Delete a conversation after confirmation."""
         if self.conversation_mgr.delete_conversation(conv_id):
@@ -612,6 +1084,59 @@ class MainWindow(QMainWindow):
         if self.sender() is self.title_worker:
             self.title_worker = None
 
+    def _show_project_context_menu(self, pos):
+        """Right-click menu for project list."""
+        item = self.project_list.itemAt(pos)
+        if not item:
+            # Right-click on empty space - deselect project
+            if QMessageBox.question(
+                self, "Deselect Project?",
+                "Clear the current project selection? You can continue chatting without a project.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            ) == QMessageBox.StandardButton.Yes:
+                self.current_project_id = None
+                self.files_cache = []
+                self.files_list.clear()
+                self.file_viewer.setVisible(False)
+                self._refresh_git_status()
+            return
+
+        proj_id = item.data(Qt.ItemDataRole.UserRole)
+        if not proj_id:
+            return
+
+        menu = QMenu(self)
+        open_in_editor_action = menu.addAction("Open Scope in File Manager")
+        menu.addSeparator()
+        refresh_action = menu.addAction("Refresh Git Status")
+        delete_action = menu.addAction("Delete Project")
+
+        action = menu.exec(self.project_list.mapToGlobal(pos))
+        if action == open_in_editor_action:
+            scope = self.project_mgr.get_project_scope(proj_id)
+            if scope:
+                # Detach from parent process and don't wait for completion
+                subprocess.Popen(
+                    ["xdg-open", str(scope)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+        elif action == refresh_action:
+            self._refresh_git_status()
+        elif action == delete_action:
+            if QMessageBox.question(
+                self, "Delete Project?",
+                f"Delete project '{item.text()}\'s scope?\n\nThis removes project metadata only. Files remain.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            ) == QMessageBox.StandardButton.Yes:
+                self.project_mgr.delete_project(proj_id)
+                if self.current_project_id == proj_id:
+                    self.current_project_id = None
+                    self.files_cache = []
+                    self._refresh_git_status()
+                self._refresh_project_list()
+
     def _rename_conversation(self, conv_id: str):
         """Prompt to rename a conversation."""
         conv_data = self.conversation_mgr.load_conversation(conv_id)
@@ -647,61 +1172,41 @@ class MainWindow(QMainWindow):
         parts = []
         if self.config["system_message"].strip():
             parts.append(self.config["system_message"].strip())
+
+        # Inject project context if active (NO file list - tools handle that)
+        if self.current_project_id:
+            proj_data = self.project_mgr.load_project(self.current_project_id)
+            if proj_data:
+                scope = proj_data["scope_path"]
+                project_ctx = (
+                    f"You are working in a project named '{proj_data['name']}' at {scope}.\n\n"
+                    f"You HAVE ACCESS TO THESE TOOLS that you MUST USE:\n"
+                    f"- read_file(path): Read a file's content\n"
+                    f"- write_file(path, content): Create or overwrite a file (auto-commits)\n"
+                    f"- list_files(recursive=true): List files in the project\n"
+                    f"- delete_file(path): Delete a file\n"
+                    f"- git_commit(message): Stage and commit changes\n\n"
+                    f"When you need to make file changes:\n"
+                    f"1. CALL write_file with the path and content\n"
+                    f"2. The file will be written automatically\n"
+                    f"3. It will be auto-committed with a brief summary\n\n"
+                    f"Do NOT write code blocks or bash commands - USE THE TOOLS DIRECTLY."
+                )
+                parts.append(project_ctx)
+
         if self.config["memories_enabled"]:
             block = self.memory_store.render(
                 self.config["memory_max_chars"]
             )
             if block:
                 parts.append("Persistent user memories:\n" + block)
+
         if not parts:
             return []
         return [{"role": "system", "content": "\n\n".join(parts)}]
 
     def _on_send_clicked(self):
-        if self.worker is not None:
-            return
-        if self.model is None:
-            QMessageBox.warning(
-                self, "No model", "No model available. Check Settings."
-            )
-            return
-        text = self.input.toPlainText().strip()
-        if not text and not self.pending_attachments:
-            return
-
-        if not self.current_conv_id:
-            self.current_conv_id = self.conversation_mgr.create_conversation()["id"]
-            self._refresh_conversation_list()
-
-        user_content = text
-        attachment_ctx = self._attachment_context(self.pending_attachments)
-        if attachment_ctx:
-            user_content = f"{text}\n\n{attachment_ctx}".strip()
-
-        self.history.append({"role": "user", "content": user_content})
-        self.transcript.append(("user", text))
-        for path in self.pending_attachments:
-            self.transcript.append(("note", f"attached: {path}"))
-
-        self.pending_attachments.clear()
-        self.attach_label.setText("")
-        self.input.clear()
-        self.ai_buffer = ""
-        self.transcript.append(("assistant", ""))
-
-        self._set_busy(True)
-        self._render()
-
-        self.worker = ChatWorker(
-            self.client, self.model,
-            self._system_messages() + self.history,
-        )
-        self.worker.chunk_received.connect(self._on_chunk)
-        self.worker.finished_ok.connect(self._on_done)
-        self.worker.failed.connect(self._on_error)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.worker.finished.connect(self._on_worker_finished)
-        self.worker.start()
+        self._send_with_tools()
 
     def _on_stop_clicked(self):
         if self.worker is not None:
@@ -743,6 +1248,107 @@ class MainWindow(QMainWindow):
 
         self._auto_save_conversation()
 
+    def _send_with_tools(self):
+        """Send message with tool support if project active."""
+        if self.model is None:
+            QMessageBox.warning(self, "No model", "No model available.")
+            return
+
+        text = self.input.toPlainText().strip()
+        if not text and not self.pending_attachments:
+            return
+
+        if not self.current_conv_id:
+            self.current_conv_id = self.conversation_mgr.create_conversation()["id"]
+            self._refresh_conversation_list()
+
+        user_content = text
+        attachment_ctx = self._attachment_context(self.pending_attachments)
+        if attachment_ctx:
+            user_content = f"{text}\n\n{attachment_ctx}".strip()
+
+        self.history.append({"role": "user", "content": user_content})
+        self.transcript.append(("user", text))
+        self.transcript.append(("note", f"sending with {'tool support' if self.current_project_id else 'no tools'}"))
+
+        self.pending_attachments.clear()
+        self.attach_label.setText("")
+        self.input.clear()
+        self.ai_buffer = ""
+        self.transcript.append(("assistant", ""))
+
+        self._set_busy(True)
+        self._render()
+
+        # Prepare system messages
+        sys_messages = self._system_messages()
+        all_messages = sys_messages + self.history
+
+        # Use tool worker if project active, else regular worker
+        if self.current_project_id:
+            tools = self._get_tool_definitions()
+            self.worker = ToolExecutionWorker(
+                self.client, self.model, all_messages, tools,
+                self._execute_tool_call
+            )
+            self.worker.content_reset.connect(self._on_tool_content_reset)
+            self.worker.content_chunk.connect(self._on_tool_content)
+            self.worker.tool_executed.connect(self._on_tool_log)
+            self.worker.thinking.connect(self._on_tool_thinking)
+            self.worker.finished_all.connect(self._on_tools_done)
+            self.worker.failed.connect(self._on_tool_error)
+            self.worker.finished.connect(self.worker.deleteLater)
+        else:
+            self.worker = ChatWorker(
+                self.client, self.model, all_messages
+            )
+            self.worker.chunk_received.connect(self._on_chunk)
+            self.worker.finished_ok.connect(self._on_done)
+            self.worker.failed.connect(self._on_error)
+            self.worker.finished.connect(self.worker.deleteLater)
+
+        self.worker.finished.connect(self._on_worker_finished)
+        self.worker.start()
+
+    def _on_tool_content_reset(self):
+        # New tool-loop iteration: start the assistant bubble fresh so
+        # per-iteration preambles don't accumulate into one message.
+        self.ai_buffer = ""
+        self.transcript[-1] = ("assistant", "")
+
+    def _on_tool_thinking(self, active: bool):
+        if active:
+            self.statusBar().showMessage("Thinking...")
+        else:
+            self.statusBar().showMessage("Generating response...")
+
+    def _on_tool_content(self, content: str):
+        if content:
+            self.ai_buffer = content
+            self.transcript[-1] = ("assistant", self.ai_buffer)
+            self._render()
+
+    def _on_tool_log(self, message: str):
+        self.transcript.append(("tool", message))
+        # Live-update the files sidebar and git status after mutations
+        if message.startswith("→ write_file") or message.startswith("→ delete_file"):
+            if self.current_project_id:
+                self._populate_files_list(self.current_project_id)
+                self._refresh_git_status()
+        self._render()
+
+    def _on_tools_done(self):
+        self._finalize_assistant()
+        self._render()
+        self._set_busy(False)
+        self.statusBar().showMessage("Response complete", 3000)
+
+    def _on_tool_error(self, message: str):
+        self._finalize_assistant()
+        self.statusBar().showMessage(f"Tool error: {message}", 5000)
+        self._render()
+        self._set_busy(False)
+
     def _set_busy(self, busy: bool):
         self.send_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
@@ -775,9 +1381,8 @@ class MainWindow(QMainWindow):
     def _render(self):
         parts = []
         for role, text in self.transcript:
-            label = {"user": "You", "assistant": "Assistant",
-                     "note": "_note_"}.get(role, role)
-            if role == "note":
+            label = {"user": "You", "assistant": "Assistant"}.get(role, role)
+            if role in ("note", "tool"):
                 parts.append(f"*{text}*")
             else:
                 parts.append(f"**{label}**\n\n{text}")

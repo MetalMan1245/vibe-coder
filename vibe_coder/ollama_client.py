@@ -46,14 +46,23 @@ class OllamaClient:
         return models[0]["name"] if models else None
 
     def _sanitize_messages(self, messages: list[dict]) -> list[dict]:
-        """Strip empty/whitespace-only content to prevent 400 errors."""
+        """Strip empty/whitespace-only content to prevent 400 errors.
+
+        Preserves assistant messages carrying tool_calls and tool-result
+        messages even when their text content is empty. Dropping these
+        orphans the tool results and breaks the model's context.
+        """
         cleaned = []
         for msg in messages:
             content = msg.get("content", "")
             if isinstance(content, str):
                 content = content.strip()
-            if content:  # Skip truly empty messages
-                cleaned.append({"role": msg["role"], "content": content})
+            has_tool_calls = bool(msg.get("tool_calls"))
+            is_tool_result = msg.get("role") == "tool"
+            if content or has_tool_calls or is_tool_result:
+                entry = dict(msg)
+                entry["content"] = content
+                cleaned.append(entry)
         return cleaned
 
     def chat(self, model: str, messages: list[dict]):
@@ -104,13 +113,85 @@ class OllamaClient:
         finally:
             self._response = None
 
-    def complete(self, model: str, messages: list) -> str:
-        """Non-streaming chat completion; returns the full reply text."""
+    def complete_with_tools(self, model: str, messages: list,
+                            tools: list[dict]) -> tuple[str, list[dict], dict]:
+        """Non-streaming chat with tool support.
+
+        Returns (content, tool_calls, message) where message is the full
+        assistant message dict (including any tool_calls), suitable for
+        appending back into the conversation verbatim.
+        """
         self._aborted = False
         messages = self._sanitize_messages(messages)
         if not messages:
             raise ValueError("No valid messages to send to Ollama")
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "tools": tools,
+        }
+        resp = requests.post(
+            f"{self.server_url}/api/chat",
+            json=payload,
+            timeout=(30, None),
+        )
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as exc:
+            try:
+                err_body = resp.text
+            except Exception:
+                err_body = ""
+            if err_body:
+                raise RuntimeError(f"Ollama API error: {err_body}") from exc
+            raise
+        data = resp.json()
+        if "error" in data:
+            raise RuntimeError(data["error"])
+
+        message = data.get("message", {})
+        content = message.get("content", "")
+
+        tool_calls = []
+        for tc in message.get("tool_calls") or []:
+            fn = tc.get("function", {})
+            args = fn.get("arguments") or {}
+            if isinstance(args, str):
+                # Some Ollama versions serialize arguments as a JSON string
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            tool_calls.append({"name": fn.get("name", ""), "arguments": args})
+
+        return content, tool_calls, message
+
+    def complete(self, model: str, messages: list) -> str:
+        """Non-streaming chat completion; returns the full reply text."""
+        content, _, _ = self.complete_with_tools(model, messages, [])
+        return content
+
+    def complete(self, model: str, messages: list) -> str:
+        """Non-streaming chat completion; returns the full reply text."""
+        content, _ = self.complete_with_tools(model, messages, [])
+        return content
+
+    # def abort(self) -> None:
+
+
+    def chat_with_tools(self, model: str, messages: list[dict], tools: list[dict]) -> str:
+        """Chat with tool definitions included (Ollama function calling)."""
+        self._aborted = False
+        messages = self._sanitize_messages(messages)
+        if not messages:
+            raise ValueError("No valid messages to send to Ollama")
+
+        # Include tools in payload if Ollama supports it
         payload = {"model": model, "messages": messages, "stream": False}
+        if tools:
+            payload["tools"] = tools
+
         resp = requests.post(
             f"{self.server_url}/api/chat",
             json=payload,
@@ -126,6 +207,7 @@ class OllamaClient:
             if err_body:
                 raise RuntimeError(f"Ollama API error: {err_body}") from exc
             raise
+
         data = resp.json()
         if "error" in data:
             raise RuntimeError(data["error"])

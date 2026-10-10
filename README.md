@@ -18,4 +18,10 @@ QScintilla or QTextEdit for text framework.
 This is vibe coded software intended for other vibe coders who otherwise don't know what they're doing (I sure don't) as such I do not guarantee that nothing will go wrong or cause any issues.  However feel free to submit an issue report if something does happen, or if you're someone who does know what you're doing feel free to submit a pull request!
 
 # Dev
-Add code block formatting if possible with Ollama output.  If not, it is time for phase 2, with structured "projects" with file access in a certain scope defined explicitly by the user.  Git access is preferable, should be able to generate a new project, initialize Git with a README and the AI should make changes directly to files in the scope without asking, warn the user the first time they make a project to frequently back up the location since the AI does not ask before making changes
+Give user access to the crrently system message in settings with a warning that is is not advised to change it, separate from the user's system message.
+
+Still no ability to deselect project and chat with no project.
+
+Encountered a bug where deleting all conversations repopulated the old conversations with the title "New Conversation" on all of them, deleting again seems to have solved it.
+
+Make the index of conversation titles human readable instead of the current random string of characters so that conversation parsing is easier.
