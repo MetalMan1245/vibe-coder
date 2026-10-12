@@ -172,11 +172,6 @@ class OllamaClient:
         content, _, _ = self.complete_with_tools(model, messages, [])
         return content
 
-    def complete(self, model: str, messages: list) -> str:
-        """Non-streaming chat completion; returns the full reply text."""
-        content, _ = self.complete_with_tools(model, messages, [])
-        return content
-
     # def abort(self) -> None:
 
 

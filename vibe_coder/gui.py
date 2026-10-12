@@ -113,7 +113,7 @@ class ToolExecutionWorker(QThread):
         self._tools = tools
         self._execute_tool = tool_executor_func
         self._aborted = False
-        self._max_tool_iterations = 30
+        self._max_tool_iterations = 15  # Reduced from 30 to prevent hangs
 
     def run(self):
         messages = list(self._messages)
@@ -956,7 +956,8 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self.current_project_id = self.project_mgr.create_project(name.strip(), scope_path)
+            proj_data = self.project_mgr.create_project(name.strip(), scope_path)
+            self.current_project_id = proj_data["id"]
             QMessageBox.information(
                 self, "Project Created",
                 f"Project '{name}' created at {scope_path}\n\n"

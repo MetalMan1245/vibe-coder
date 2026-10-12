@@ -271,6 +271,9 @@ class ProjectManager:
             if result.returncode == 0:
                 self._log_activity(proj_id, f"Committed: {message}")
                 return True, result.stdout
+            elif "nothing to commit" in result.stderr.lower():
+                self._log_activity(proj_id, f"Clean repo: {message}")
+                return True, "Nothing to commit"
             else:
                 return False, result.stderr or "Git commit failed"
         except subprocess.SubprocessError as exc:
