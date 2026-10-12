@@ -18,13 +18,11 @@ QScintilla or QTextEdit for text framework.
 This is vibe coded software intended for other vibe coders who otherwise don't know what they're doing (I sure don't) as such I do not guarantee that nothing will go wrong or cause any issues.  However feel free to submit an issue report if something does happen, or if you're someone who does know what you're doing feel free to submit a pull request!
 
 # Dev
-Give user access to the currently hardcoded system message in settings with a warning that is is not advised to change it, separate from the user's system message.
-
 Tool calls are printed in the conversation upon sending the message, but reloading the app clears them, tool calls should remain persistent in the conversation file.  In addition, very few tool calls are now preserved in the project, most are deleted immediately after they are finished being used.
 
 Make the index of conversation titles human readable instead of the current random string of characters so that conversation parsing is easier.
 
-Encountered a bug where deleting all conversations repopulated the old conversations with the title "New Conversation" on all of them, deleting again seems to have solved it.  Most recent code changes did not fix it.
+Still encountering the bug where longer conversation titles will not ellipse properly and hide the delete icon.
 
 Print the Ollama spinning blocks to indicate that the model is thinking, print the thinking output if it is available.
 
@@ -33,3 +31,5 @@ Display for context usage for the selected model and ability to alter ollama par
 There should be a persistent indication of the active project (hidden if no project active) in the conversations tab so that the user does not have to switch back to the Projects tab to check the active project.
 
 Run script for easy testing execution.
+
+Change project name to Monkey instead of vibe coder.

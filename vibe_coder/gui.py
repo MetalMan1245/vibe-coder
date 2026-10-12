@@ -9,17 +9,18 @@ import subprocess
 
 import requests
 import os, sys
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QTextCursor, QFont, QMouseEvent, QTextOption
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QTextBrowser, QTextEdit,
-    QVBoxLayout, QWidget, QSplitter, QMenu, QStyle, QInputDialog
+    QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSizePolicy,
+    QTextBrowser, QTextEdit, QVBoxLayout, QWidget, QSplitter, QMenu,
+    QStyle, QInputDialog
 )
 
 from vibe_coder import __version__
-from vibe_coder.config import load_config, save_config
+from vibe_coder.config import load_config, save_config, DEFAULTS
 from vibe_coder.memory import MemoryStore
 from vibe_coder.ollama_client import OllamaClient
 from vibe_coder.conversation_manager import ConversationManager
@@ -229,7 +230,7 @@ class SettingsDialog(QDialog):
         self.config = config
         self.conversation_mgr = conversation_mgr
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(520)
 
         self.url_edit = QLineEdit(config["server_url"])
 
@@ -244,6 +245,23 @@ class SettingsDialog(QDialog):
         self.sys_edit.setPlaceholderText("System message, e.g. 'My OS is CachyOS unless otherwise specified.'")
         self.sys_edit.setPlainText(config["system_message"])
         self.sys_edit.setMaximumHeight(100)
+
+        # Advanced section toggle
+        self.advanced_check = QCheckBox("Show advanced options")
+        self.advanced_check.stateChanged.connect(self._toggle_advanced)
+
+        # AI Tools Template (advanced, hidden by default)
+        self.tools_edit = QTextEdit()
+        self.tools_edit.setPlaceholderText("Tools template for projects - use {project_name} and {scope_path} placeholders")
+        self.tools_edit.setPlainText(config.get("tools_template", DEFAULTS["tools_template"]))
+        self.tools_edit.setMaximumHeight(150)
+        self.tools_edit.setVisible(False)
+
+        self.tools_warning_label = QLabel("⚠️ WARNING: Changing this template can break tool behavior. "
+                                          "Only modify if you understand how the AI interprets tool instructions.")
+        self.tools_warning_label.setStyleSheet("color: #cc6600; font-size: 11px; padding: 6px;")
+        self.tools_warning_label.setWordWrap(True)
+        self.tools_warning_label.setVisible(False)
 
         self.mem_check = QCheckBox("Inject memories into the system message")
         self.mem_check.setChecked(config["memories_enabled"])
@@ -272,11 +290,24 @@ class SettingsDialog(QDialog):
         form.addLayout(model_row)
         form.addWidget(QLabel("System message:"))
         form.addWidget(self.sys_edit)
+        form.addWidget(self.advanced_check)
+        self.tools_label = QLabel("AI Tools Template (for projects):")
+        self.tools_label.setVisible(False)
+        form.addWidget(self.tools_label)
+        form.addWidget(self.tools_edit)
+        form.addWidget(self.tools_warning_label)
         form.addLayout(mem_row)
         form.addWidget(self.storage_label)
         form.addWidget(buttons)
 
         self.refresh_models()
+
+    def _toggle_advanced(self):
+        """Toggle visibility of advanced options."""
+        show = self.advanced_check.isChecked()
+        self.tools_label.setVisible(show)
+        self.tools_edit.setVisible(show)
+        self.tools_warning_label.setVisible(show)
 
     def refresh_models(self):
         probe = OllamaClient(self.url_edit.text().strip())
@@ -302,6 +333,7 @@ class SettingsDialog(QDialog):
             "server_url": self.url_edit.text().strip(),
             "model": self.model_combo.currentText(),
             "system_message": self.sys_edit.toPlainText(),
+            "tools_template": self.tools_edit.toPlainText(),
             "memories_enabled": self.mem_check.isChecked(),
         }
 
@@ -320,18 +352,25 @@ class ConversationListItem(QWidget):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 6, 4, 6)
-        layout.setSpacing(8)
+        layout.setSpacing(4)
 
         text_column = QVBoxLayout()
-        text_column.setSpacing(0)
+        text_column.setSpacing(2)
 
-        self.title_label = QLabel()
-        metrics = self.title_label.fontMetrics()
-        self.title_label.setText(metrics.elidedText(
-            entry["title"], Qt.TextElideMode.ElideRight, max_title_width
-        ))
+        # Title label: Ignored horizontal policy means the label never
+        # inflates the widget's size hint, so long titles cannot push
+        # the item wider than the list (which clipped the delete button).
+        # Actual elision is computed in resizeEvent once the real
+        # width is known, not here at construction time.
+        self.title_label = QLabel(entry["title"])
         self.title_label.setStyleSheet("font-weight: bold;")
+        self.title_label.setWordWrap(False)
+        self.title_label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        self.title_label.setMinimumWidth(0)
+        self.title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.title_label.setToolTip(entry["title"])
 
+        # Metadata row (time + message count)
         time_label = QLabel(entry["updated"][:16].replace("T", " "))
         time_label.setStyleSheet("font-size: 11px; color: gray;")
 
@@ -345,10 +384,13 @@ class ConversationListItem(QWidget):
         meta_row.addWidget(time_label)
         meta_row.addWidget(msg_count)
         meta_row.addStretch(1)
+        meta_row.setContentsMargins(0, 0, 0, 0)
+        meta_row.setSpacing(4)
 
         text_column.addWidget(self.title_label)
         text_column.addLayout(meta_row)
 
+        # Delete button
         self.delete_btn = QPushButton()
         self.delete_btn.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_TrashIcon)
@@ -356,16 +398,31 @@ class ConversationListItem(QWidget):
         self.delete_btn.setFixedSize(28, 28)
         self.delete_btn.setToolTip("Delete conversation")
         self.delete_btn.setStyleSheet(
-            "QPushButton { border: none; background-color: transparent; }"
+            "QPushButton { border: none; background-color: transparent; padding: 0; margin: 0; }"
             "QPushButton:hover { background-color: rgba(255, 0, 0, 0.15);"
             " border-radius: 4px; }"
         )
         self.delete_btn.clicked.connect(self._confirm_delete)
 
+        # Add text column and delete button to main layout
         layout.addLayout(text_column, stretch=1)
-        layout.addWidget(self.delete_btn, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(self.delete_btn)
 
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def _elide_title(self):
+        """Recompute the elided title for the current real widget width."""
+        # Left/right margins (8 + 4), spacing (4), delete button (28)
+        available = self.width() - 44
+        if available < 30:
+            available = 30
+        self.title_label.setText(self.title_label.fontMetrics().elidedText(
+            self.entry["title"], Qt.TextElideMode.ElideRight, available
+        ))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide_title()
 
     def _confirm_delete(self):
         if QMessageBox.question(
@@ -620,6 +677,13 @@ class MainWindow(QMainWindow):
             f"Connected to {self.client.server_url} | Model: {self.model}"
         )
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Widget geometry is only reliable after the window is realized;
+        # rebuild the list so item widths and elision use real sizes
+        # instead of the pre-show defaults.
+        self._refresh_conversation_list()
+
     def _refresh_conversation_list(self):
         """Reload the conversation sidebar."""
         self.conversation_list.clear()
@@ -630,17 +694,20 @@ class MainWindow(QMainWindow):
             self.conversation_list.addItem(item)
             return
 
-        title_width = max(self.conversation_list.width() - 70, 100)
         for entry in conversations:
             size_text = self.conversation_mgr.get_conversation_size(entry["id"])
             widget = ConversationListItem(
-                entry, max_title_width=title_width, size_text=size_text
+                entry, size_text=size_text
             )
             widget.clicked.connect(self._load_conversation)
             widget.deleted.connect(self._delete_conversation)
             widget.rename_requested.connect(self._rename_conversation)
             item = QListWidgetItem()
-            item.setSizeHint(widget.sizeHint())
+            # Pin the item width to the viewport so the widget can never
+            # be wider than the visible list (which hid the delete button
+            # behind horizontal scrolling).
+            viewport_width = self.conversation_list.viewport().width()
+            item.setSizeHint(QSize(max(viewport_width, 120), widget.sizeHint().height()))
             self.conversation_list.addItem(item)
             self.conversation_list.setItemWidget(item, widget)
 
@@ -1200,19 +1267,10 @@ class MainWindow(QMainWindow):
             proj_data = self.project_mgr.load_project(self.current_project_id)
             if proj_data:
                 scope = proj_data["scope_path"]
-                project_ctx = (
-                    f"You are working in a project named '{proj_data['name']}' at {scope}.\n\n"
-                    f"You HAVE ACCESS TO THESE TOOLS that you MUST USE:\n"
-                    f"- read_file(path): Read a file's content\n"
-                    f"- write_file(path, content): Create or overwrite a file (auto-commits)\n"
-                    f"- list_files(recursive=true): List files in the project\n"
-                    f"- delete_file(path): Delete a file\n"
-                    f"- git_commit(message): Stage and commit changes\n\n"
-                    f"When you need to make file changes:\n"
-                    f"1. CALL write_file with the path and content\n"
-                    f"2. The file will be written automatically\n"
-                    f"3. It will be auto-committed with a brief summary\n\n"
-                    f"Do NOT write code blocks or bash commands - USE THE TOOLS DIRECTLY."
+                template = self.config.get("tools_template", DEFAULTS["tools_template"])
+                project_ctx = template.format(
+                    project_name=proj_data["name"],
+                    scope_path=scope
                 )
                 parts.append(project_ctx)
 
