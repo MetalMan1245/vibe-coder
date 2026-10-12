@@ -145,7 +145,10 @@ class ProjectManager:
         proj_data = self.load_project(proj_id)
         if not proj_data:
             return None
-        return Path(proj_data["scope_path"])
+        scope = Path(proj_data["scope_path"])
+        if not scope.exists():
+            return None
+        return scope
 
     def read_file(self, proj_id: str, relative_path: str) -> str | None:
         """Read a file within the project scope."""
@@ -218,7 +221,7 @@ class ProjectManager:
         repo plumbing objects.
         """
         scope = self.get_project_scope(proj_id)
-        if not scope or not scope.exists():
+        if not scope:
             return []
 
         ignored = {".git", "__pycache__", "node_modules", ".venv",

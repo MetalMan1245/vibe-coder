@@ -730,7 +730,22 @@ class MainWindow(QMainWindow):
 
         proj_id = selected[0].data(Qt.ItemDataRole.UserRole)
         if proj_id:
-            self._load_project_by_id(proj_id)
+            loaded = self._load_project_by_id(proj_id)
+            if not loaded:
+                # Scope directory missing - clear selection and warn
+                QMessageBox.warning(
+                    self, "Project Scope Missing",
+                    f"The scope directory for this project no longer exists.\n\n"
+                    f"This project entry will be removed from the list.",
+                    QMessageBox.StandardButton.Ok
+                )
+                self.project_mgr.delete_project(proj_id)
+                self.current_project_id = None
+                self.files_cache = []
+                self.files_list.clear()
+                self.file_viewer.setVisible(False)
+                self._refresh_project_list()
+                return
             self._populate_files_list(proj_id)  # Always populate when selected
 
     def _get_tool_definitions(self) -> list[dict]:
@@ -1024,16 +1039,22 @@ class MainWindow(QMainWindow):
             changes = len([l for l in status.split("\n") if l.strip()])
             self.git_status_label.setText(f"Git: {changes} change(s)")
 
-    def _load_project_by_id(self, proj_id: str):
-        """Load a project by ID."""
+    def _load_project_by_id(self, proj_id: str) -> bool:
+        """Load a project by ID. Returns True if successful."""
         proj_data = self.project_mgr.load_project(proj_id)
         if not proj_data:
-            return
+            return False
+
+        # Verify scope directory still exists
+        scope = self.project_mgr.get_project_scope(proj_id)
+        if not scope:
+            return False
 
         self.current_project_id = proj_id
         self.files_cache = self.project_mgr.list_files(proj_id)
         self._refresh_git_status()
         self.statusBar().showMessage(f"Active project: {proj_data['name']}")
+        return True
 
     def _delete_conversation(self, conv_id: str):
         """Delete a conversation after confirmation."""
