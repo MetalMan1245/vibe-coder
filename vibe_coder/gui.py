@@ -10,7 +10,7 @@ import subprocess
 import requests
 import os, sys
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QTextCursor, QFont, QMouseEvent, QTextOption
+from PyQt6.QtGui import QTextCursor, QFont, QMouseEvent, QTextOption, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
@@ -23,7 +23,7 @@ from vibe_coder import __version__
 from vibe_coder.config import load_config, save_config, DEFAULTS
 from vibe_coder.memory import MemoryStore
 from vibe_coder.ollama_client import OllamaClient
-from vibe_coder.conversation_manager import ConversationManager
+from vibe_coder.conversation_manager import ConversationManager, CONVERSATIONS_DIR
 
 MAX_ATTACHMENT_CHARS = 200_000
 
@@ -102,7 +102,7 @@ class ToolExecutionWorker(QThread):
     content_chunk = pyqtSignal(str)      # complete content for this iteration
     tool_executed = pyqtSignal(str)       # one-line tool log
     thinking = pyqtSignal(bool)           # request in flight indicator
-    finished_all = pyqtSignal()
+    finished_all = pyqtSignal(list)      # pass back full messages list
     failed = pyqtSignal(str)
 
     def __init__(self, client: OllamaClient, model: str, messages: list,
@@ -142,6 +142,14 @@ class ToolExecutionWorker(QThread):
                     break
 
                 for tc in tool_calls:
+                    # Validate tool call structure before executing
+                    if not tc.get("name"):
+                        self.tool_executed.emit("→ Error: Tool call missing name, skipping")
+                        continue
+                    if not isinstance(tc.get("arguments"), dict):
+                        self.tool_executed.emit(f"→ Error: Invalid arguments for {tc['name']}, skipping")
+                        continue
+
                     result = self._execute_tool(tc)
                     first_line = result.splitlines()[0] if result else ""
                     self.tool_executed.emit(
@@ -153,7 +161,8 @@ class ToolExecutionWorker(QThread):
                         "content": result,
                     })
 
-            self.finished_all.emit()
+            # Emit the COMPLETE messages list so caller can persist it
+            self.finished_all.emit(messages)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -343,6 +352,7 @@ class ConversationListItem(QWidget):
     clicked = pyqtSignal(str)
     deleted = pyqtSignal(str)
     rename_requested = pyqtSignal(str)
+    reveal_requested = pyqtSignal(str)
 
     def __init__(self, entry: dict, max_title_width: int = 170,
                  size_text: str = "", parent=None):
@@ -442,12 +452,15 @@ class ConversationListItem(QWidget):
         menu = QMenu(self)
         rename_action = menu.addAction("Rename...")
         copy_action = menu.addAction("Copy")
+        reveal_action = menu.addAction("Show Conversation File")
         delete_action = menu.addAction("Delete")
         action = menu.exec(event.globalPos())
         if action == rename_action:
             self.rename_requested.emit(self.conv_id)
         elif action == copy_action:
             QApplication.clipboard().setText(self.entry["title"])
+        elif action == reveal_action:
+            self.reveal_requested.emit(self.conv_id)
         elif action == delete_action:
             self._confirm_delete()
 
@@ -702,6 +715,7 @@ class MainWindow(QMainWindow):
             widget.clicked.connect(self._load_conversation)
             widget.deleted.connect(self._delete_conversation)
             widget.rename_requested.connect(self._rename_conversation)
+            widget.reveal_requested.connect(self._reveal_conversation_file)
             item = QListWidgetItem()
             # Pin the item width to the viewport so the widget can never
             # be wider than the visible list (which hid the delete button
@@ -764,25 +778,18 @@ class MainWindow(QMainWindow):
 
         self.current_conv_id = conv_id
         self.history = conv_data.get("messages", [])
-        self.transcript = [(m["role"], m["content"]) for m in self.history]
+        self.transcript = [
+            (m["role"], m["content"])
+            for m in self.history
+            if m.get("content", "").strip()
+        ]
         self.ai_buffer = ""
         self._render()
         self.statusBar().showMessage(f"Loaded conversation: {conv_data.get('title', '')}")
 
     def _auto_save_conversation(self):
-        """Persist current conversation to disk."""
-        if not self.current_conv_id:
-            return
-
-        if not self.history:
-            return  # Nothing to save
-
-        self.conversation_mgr.save_conversation(self.current_conv_id, self.history)
-
-        conv_data = self.conversation_mgr.load_conversation(self.current_conv_id)
-        if conv_data and conv_data.get("title") == "New Conversation":
-            self._request_ai_title(self.current_conv_id)
-
+        """Persist current conversation to disk - DEPRECATED, use _save_current_history."""
+        self._save_current_history()
         self.statusBar().showMessage(f"Saved conversation {self.current_conv_id[:8]}...", 3000)
 
     def _on_project_selected(self):
@@ -920,6 +927,12 @@ class MainWindow(QMainWindow):
         """Execute a tool call and return the result."""
         name = tool.get("name", "")
         args = tool.get("arguments", {})
+
+        # Validate tool structure before executing
+        if not name:
+            return "[Error: Tool call missing name]"
+        if not isinstance(args, dict):
+            return f"[Error: Invalid arguments for {name}] - got {type(args).__name__}"
 
         try:
             if name == "read_file":
@@ -1226,6 +1239,34 @@ class MainWindow(QMainWindow):
                     self._refresh_git_status()
                 self._refresh_project_list()
 
+    def _reveal_conversation_file(self, conv_id: str):
+        """Open the file manager with the conversation file selected."""
+        path = CONVERSATIONS_DIR / f"{conv_id}.json"
+        if not path.exists():
+            QMessageBox.warning(
+                self, "Missing File",
+                f"The conversation file for this entry no longer exists:\n{path}"
+            )
+            return
+
+        self.statusBar().showMessage(str(path), 10000)
+
+        # FileManager1 is the freedesktop-standard way to ask the file
+        # manager to open the parent with the file pre-selected
+        # (works in Dolphin, Nautilus, Thunar, etc.).
+        result = subprocess.run(
+            ["dbus-send", "--session", "--print-reply",
+             "--dest=org.freedesktop.FileManager1",
+             "/org/freedesktop/FileManager1",
+             "org.freedesktop.FileManager1.ShowItems",
+             f"array:string:{path.as_uri()}", "string:"],
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            # Fallback: just open the containing directory
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(CONVERSATIONS_DIR)))
+
     def _rename_conversation(self, conv_id: str):
         """Prompt to rename a conversation."""
         conv_data = self.conversation_mgr.load_conversation(conv_id)
@@ -1318,15 +1359,28 @@ class MainWindow(QMainWindow):
 
     def _finalize_assistant(self):
         if self.ai_buffer:
-            self.history.append(
-                {"role": "assistant", "content": self.ai_buffer}
+            # Find the last assistant message in history and update it
+            # (since worker may have already added it with tool_calls)
+            last_assistant_idx = next(
+                (i for i, m in enumerate(self.history) if m.get("role") == "assistant"),
+                len(self.history)
             )
-        elif self.transcript and self.transcript[-1][0] == "assistant":
-            if not self.transcript[-1][1]:
-                self.transcript.pop()
+
+            # If worker didn't add assistant message yet, add it now
+            if last_assistant_idx == len(self.history):
+                self.history.append({"role": "assistant", "content": self.ai_buffer})
+            elif not self.history[last_assistant_idx].get("content"):
+                # Worker added message but no content yet (has tool_calls)
+                self.history[last_assistant_idx]["content"] = self.ai_buffer
+
         self.ai_buffer = ""
 
-        self._auto_save_conversation()
+        while (self.transcript
+               and self.transcript[-1][0] in ("assistant", "note")
+               and not self.transcript[-1][1].strip()):
+            self.transcript.pop()
+
+        self._save_current_history()
 
     def _send_with_tools(self):
         """Send message with tool support if project active."""
@@ -1417,7 +1471,41 @@ class MainWindow(QMainWindow):
                 self._refresh_git_status()
         self._render()
 
-    def _on_tools_done(self):
+    def _save_current_history(self):
+        """Save current conversation history to disk with all tool calls."""
+        if not self.current_conv_id or not self.history:
+            return
+
+        self.conversation_mgr.save_conversation(
+            self.current_conv_id,
+            self.history,
+            title=None  # Preserve existing title
+        )
+
+        conv_data = self.conversation_mgr.load_conversation(self.current_conv_id)
+        if conv_data and conv_data.get("title") == "New Conversation":
+            self._request_ai_title(self.current_conv_id)
+
+    def _on_tools_done(self, updated_messages: list = None):
+        # If worker sent back the full messages list, preserve tool calls
+        if updated_messages is not None:
+            # Reconstruct history preserving original structure but keeping tool_calls
+            new_history = []
+            for m in updated_messages:
+                if m.get("role") == "system":
+                    continue
+                # Ensure only serializable fields are kept
+                entry = {
+                    "role": m.get("role"),
+                    "content": m.get("content", ""),
+                }
+                if "tool_calls" in m and m["tool_calls"]:
+                    entry["tool_calls"] = m["tool_calls"]
+                if m.get("role") == "tool":
+                    entry["tool_name"] = m.get("tool_name", "")
+                new_history.append(entry)
+            self.history = new_history
+
         self._finalize_assistant()
         self._render()
         self._set_busy(False)
@@ -1461,8 +1549,14 @@ class MainWindow(QMainWindow):
     def _render(self):
         parts = []
         for role, text in self.transcript:
+            if role == "tool":
+                safe = text.replace("```", "'''")
+                parts.append(f"```text\n{safe}\n```")
+                continue
+            if not text.strip():
+                continue
             label = {"user": "You", "assistant": "Assistant"}.get(role, role)
-            if role in ("note", "tool"):
+            if role == "note":
                 parts.append(f"*{text}*")
             else:
                 parts.append(f"**{label}**\n\n{text}")
