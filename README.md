@@ -18,7 +18,13 @@ QScintilla or QTextEdit for text framework.
 This is vibe coded software intended for other vibe coders who otherwise don't know what they're doing (I sure don't) as such I do not guarantee that nothing will go wrong or cause any issues.  However feel free to submit an issue report if something does happen, or if you're someone who does know what you're doing feel free to submit a pull request!
 
 # Dev
-Print the Ollama spinning blocks to indicate that the model is thinking, print the thinking output if it is available.
+Git commits still report failure even though they seem to be working just fine.
+/home/f/.config/vibe-coder/conversations/fa341ece-f29c-4e27-9df3-702169f8b69c.json
+
+Cases where the  conversation can extend to needs a horizontal scroll bar, there should never be a horizontal scroll bar under any circumstances.
+/home/f/.config/vibe-coder/conversations/fa341ece-f29c-4e27-9df3-702169f8b69c.json
+/home/f/.config/vibe-coder/conversations/c7eb7bb5-23d1-4cb1-baf5-df528c6ec167.json
+/home/f/.config/vibe-coder/conversations/d8ec23f1-e363-43ee-a601-a13e40b05951.json
 
 Display for context usage for the selected model and ability to alter ollama parameters graphically if possible.
 
@@ -31,3 +37,7 @@ Change project name to Monkey instead of vibe coder.
 Change advanced settings toggle to a different tab in the settings dialog.
 
 LLM web extract, web search, other useful coding tool usage.
+
+Move Settings to top right, status indication to where settings is, directly above chat box.
+
+Default user system message:  My OS is <fill in user's linux distro> unless otherwise specified.

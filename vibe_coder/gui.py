@@ -9,7 +9,7 @@ import subprocess
 
 import requests
 import os, sys
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QTextCursor, QFont, QMouseEvent, QTextOption, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -165,6 +165,73 @@ class ToolExecutionWorker(QThread):
             self.finished_all.emit(messages)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+class ModelStatusIndicator(QLabel):
+    """Visual indicator showing model state with spinner animation."""
+
+    # Spinner frames (braille dots animation, similar to Ollama terminal)
+    SPINNERS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    # Status colors
+    COLOR_IDLE = "#888888"       # Gray - inactive
+    COLOR_THINKING = "#6d4aff"   # Purple - working
+    COLOR_STOPPED = "#ff6b6b"    # Red - stopped
+    COLOR_ERROR = "#ffaa00"      # Orange - error/retrying
+
+    def __init__(self, parent=None):
+        super().__init__("● Idle", parent)
+        self.setStyleSheet(f"color: {self.COLOR_IDLE}; font-family: monospace; font-size: 13px;")
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._advance_spinner)
+        self._frame = 0
+
+    def _advance_spinner(self):
+        """Advance spinner animation frame."""
+        self._frame = (self._frame + 1) % len(self.SPINNERS)
+        if self.status == "thinking":
+            spinner = self.SPINNERS[self._frame]
+            self.setText(f"{spinner} Thinking...")
+
+    def set_status(self, status: str, message: str = None):
+        """Set the status indicator state.
+
+        status: "idle", "thinking", "stopped", "error"
+        message: optional custom message after spinner
+        """
+        self._timer.stop()
+        self._frame = 0
+
+        if status == "idle":
+            self.setText("● Idle")
+            self.setStyleSheet(f"color: {self.COLOR_IDLE}; font-family: monospace; font-size: 13px;")
+            self.status = "idle"
+
+        elif status == "thinking":
+            self.setText("⠋ Thinking...")
+            self.setStyleSheet(f"color: {self.COLOR_THINKING}; font-family: monospace; font-size: 13px;")
+            self.status = "thinking"
+            self._timer.start(100)  # 10fps for smooth animation
+
+        elif status == "stopped":
+            self.setText("■ Stopped")
+            self.setStyleSheet(f"color: {self.COLOR_STOPPED}; font-family: monospace; font-size: 13px;")
+            self.status = "stopped"
+
+        elif status == "error":
+            msg = message or "Error"
+            self.setText(f"✗ {msg}")
+            self.setStyleSheet(f"color: {self.COLOR_ERROR}; font-family: monospace; font-size: 13px;")
+            self.status = "error"
+
+    def update_thinking_message(self, message: str):
+        """Update the thinking message while keeping spinner running."""
+        if self.status == "thinking":
+            self._timer.stop()
+            self._frame = (self._frame + 1) % len(self.SPINNERS)
+            spinner = self.SPINNERS[self._frame]
+            self.setText(f"{spinner} {message}...")
+            self._timer.start(100)
+
 
 class ChatInput(QTextEdit):
     """Multi-line input. Enter sends, Shift+Enter inserts a newline."""
@@ -487,6 +554,8 @@ class MainWindow(QMainWindow):
         self.current_conv_id: str | None = None
         self.current_project_id: str | None = None
         self.files_cache: list[str] = []
+        self.spinner_frame = 0
+        self.spinner_timer: QTimer | None = None
 
         self.setAcceptDrops(True)
 
@@ -605,6 +674,11 @@ class MainWindow(QMainWindow):
         self.settings_btn.clicked.connect(self._open_settings)
         top = QHBoxLayout()
         top.addWidget(self.settings_btn)
+
+        # Model status indicator
+        self.model_indicator = ModelStatusIndicator()
+        top.addWidget(self.model_indicator)
+
         top.addStretch(1)
         chat_layout.addLayout(top)
 
@@ -1337,17 +1411,20 @@ class MainWindow(QMainWindow):
         self.ai_buffer += delta
         self.transcript[-1] = ("assistant", self.ai_buffer)
         self._render()
+        self.model_indicator.update_thinking_message("Generating")
 
     def _on_done(self):
         self._finalize_assistant()
         self._render()
         self._set_busy(False)
+        self.model_indicator.set_status("idle")
 
     def _on_error(self, message: str):
         self._finalize_assistant()
         self.statusBar().showMessage(f"Error: {message}")
         self._render()
         self._set_busy(False)
+        self.model_indicator.set_status("error", message[:30])
 
     def _on_worker_finished(self):
         if self.ai_buffer:
@@ -1414,6 +1491,9 @@ class MainWindow(QMainWindow):
         self._set_busy(True)
         self._render()
 
+        # Start thinking indicator immediately
+        self.model_indicator.set_status("thinking")
+
         # Prepare system messages
         sys_messages = self._system_messages()
         all_messages = sys_messages + self.history
@@ -1453,8 +1533,10 @@ class MainWindow(QMainWindow):
     def _on_tool_thinking(self, active: bool):
         if active:
             self.statusBar().showMessage("Thinking...")
+            self.model_indicator.set_status("thinking")
         else:
             self.statusBar().showMessage("Generating response...")
+            self.model_indicator.update_thinking_message("Generating")
 
     def _on_tool_content(self, content: str):
         if content:
@@ -1509,6 +1591,7 @@ class MainWindow(QMainWindow):
         self._finalize_assistant()
         self._render()
         self._set_busy(False)
+        self.model_indicator.set_status("idle")
         self.statusBar().showMessage("Response complete", 3000)
 
     def _on_tool_error(self, message: str):
@@ -1516,10 +1599,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Tool error: {message}", 5000)
         self._render()
         self._set_busy(False)
+        self.model_indicator.set_status("error", "Tool error")
 
     def _set_busy(self, busy: bool):
         self.send_btn.setEnabled(not busy)
         self.stop_btn.setEnabled(busy)
+        if busy:
+            self.model_indicator.set_status("thinking")
+        else:
+            self.model_indicator.set_status("idle")
 
     def _attach_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Attach file")
