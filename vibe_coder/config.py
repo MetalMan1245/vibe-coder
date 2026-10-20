@@ -35,6 +35,16 @@ DEFAULTS = {
         "3. It will be auto-committed with a brief summary\n\n"
         "Do NOT write code blocks or bash commands - USE THE TOOLS DIRECTLY."
     ),
+    # Appended to the project context when a .vibeignore is in effect,
+    # so the model knows why some files are invisible to its tools.
+    "vibeignore_note": (
+        "A `.vibeignore` file (gitignore syntax) filters this project's "
+        "files from your tools to save context: build artifacts, caches "
+        "and other ignored paths are hidden from list_files and cannot be "
+        "read by read_file. Do not try to access them; if the user needs "
+        "one visible, they can edit `.vibeignore`. This file only affects "
+        "this application, never git."
+    ),
     "memories_enabled": False,
     # Hard cap on injected memory text. This is the prompt-bloat guard:
     # ~1200 chars is roughly 300 tokens, negligible for local models.

@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSizePolicy,
     QTextBrowser, QTextEdit, QVBoxLayout, QWidget, QSplitter, QMenu,
-    QStyle, QInputDialog
+    QStyle, QInputDialog, QScrollArea
 )
 
 from vibe_coder import __version__
@@ -24,6 +24,7 @@ from vibe_coder.config import load_config, save_config, DEFAULTS
 from vibe_coder.memory import MemoryStore
 from vibe_coder.ollama_client import OllamaClient
 from vibe_coder.conversation_manager import ConversationManager, CONVERSATIONS_DIR
+from vibe_coder.vibeignore import VIBEIGNORE_FILENAME, TEMPLATE_NAMES, pretty_name
 
 MAX_ATTACHMENT_CHARS = 200_000
 
@@ -412,6 +413,173 @@ class SettingsDialog(QDialog):
             "tools_template": self.tools_edit.toPlainText(),
             "memories_enabled": self.mem_check.isChecked(),
         }
+
+class VibeIgnoreDialog(QDialog):
+    """Edit the project's .vibeignore — the context-only ignore file.
+
+    Separate from .gitignore on purpose: rules here only hide files from
+    the AI (listings/reads) to save context; git is never affected, so
+    internal docs can stay visible to vibe-coder while excluded from
+    publishing, and vice versa.
+    """
+
+    def __init__(self, project_mgr, proj_id: str, parent=None):
+        super().__init__(parent)
+        self.project_mgr = project_mgr
+        self.proj_id = proj_id
+        self.setWindowTitle(f"Edit {VIBEIGNORE_FILENAME} — context filter")
+        self.setMinimumSize(560, 480)
+
+        intro = QLabel(
+            f"<b>{VIBEIGNORE_FILENAME}</b> is read <u>only by vibe-coder</u> "
+            "(never by git). Files matching these patterns are hidden from the "
+            "model's <code>list_files</code>/<code>read_file</code> tools to "
+            "save context. Syntax = standard gitignore patterns "
+            "(comments with <code>#</code>, negation with <code>!</code>, "
+            "<code>**</code> globs, trailing <code>/</code> for directories)."
+        )
+        intro.setWordWrap(True)
+
+        self.editor = QTextEdit()
+        self.editor.setPlaceholderText("# one pattern per line, e.g.\ntarget/\n__pycache__/\nnotes/private/**")
+        current = self.project_mgr.read_vibeignore(proj_id)
+        if current is None:
+            from vibe_coder.vibeignore import default_content
+            current = default_content([])
+            self.editor.setToolTip("(file not on disk yet — pressing Save will create it)")
+        self.editor.setPlainText(current)
+        self.editor.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+
+        self.templates_btn = QPushButton("Add language templates…")
+        self.templates_btn.clicked.connect(self._add_templates)
+        self.restore_btn = QPushButton("Restore defaults")
+        self.restore_btn.clicked.connect(self._restore_defaults)
+        buttons_row = QHBoxLayout()
+        buttons_row.addWidget(self.templates_btn)
+        buttons_row.addWidget(self.restore_btn)
+        buttons_row.addStretch(1)
+
+        box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        box.accepted.connect(self._save)
+        box.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(intro)
+        layout.addWidget(self.editor, stretch=1)
+        layout.addLayout(buttons_row)
+        layout.addWidget(box)
+
+    def _add_templates(self):
+        keys = TemplatePickerDialog(self).exec()
+        if keys == QDialog.DialogCode.Rejected:
+            return
+        added_keys = TemplatePickerDialog.selected_keys
+        text = self.editor.toPlainText().rstrip("\n")
+        from vibe_coder.vibeignore import TEMPLATES
+        existing = {l.strip() for l in text.splitlines() if l.strip()}
+        for key in added_keys:
+            block = TEMPLATES.get(key, [])
+            missing = [l for l in block[1:] if l.strip() and l.strip() not in existing]
+            if not missing:
+                continue
+            text += "\n\n" + "\n".join(block)
+            existing.update(l.strip() for l in block if l.strip())
+        self.editor.setPlainText(text + "\n")
+
+    def _restore_defaults(self):
+        if QMessageBox.question(
+            self, "Restore defaults?",
+            "Replace the editor contents with the generated starter rules?\n"
+            "(Nothing is written until you press Save.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        from vibe_coder.vibeignore import default_content
+        self.editor.setPlainText(default_content([]))
+
+    def _save(self):
+        content = self.editor.toPlainText()
+        if content and not content.endswith("\n"):
+            content += "\n"
+        if not self.project_mgr.write_vibeignore(self.proj_id, content):
+            QMessageBox.critical(self, "Error",
+                                 f"Could not write {VIBEIGNORE_FILENAME}.")
+            return
+        count, warnings = self.project_mgr.reload_vibeignore(self.proj_id)
+        if warnings:
+            QMessageBox.warning(
+                self, "Some patterns skipped",
+                "Saved with warnings:\n\n" + "\n".join(warnings[:10])
+            )
+        else:
+            QMessageBox.information(
+                self, "Saved",
+                f"{VIBEIGNORE_FILENAME} updated: {count} active rule(s).\n"
+                "The AI now sees a filtered file listing."
+            )
+        self.accept()
+
+
+class TemplatePickerDialog(QDialog):
+    """GitHub-Desktop style template picker, but for .vibeignore rules.
+
+    exec() returns Accepted/Rejected; chosen keys are exposed via the
+    class-level ``selected_keys`` attribute after acceptance.
+    """
+
+    selected_keys: list[str] = []
+
+    def __init__(self, parent=None, title: str = "Add vibeignore templates",
+                 message: str = ("Choose languages to add their build/cache junk "
+                                 "to the context filter:")):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(320)
+        TemplatePickerDialog.selected_keys = []
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(message))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        grid_layout = QVBoxLayout(container)
+        grid_layout.setSpacing(4)
+        self._checks: dict[str, QCheckBox] = {}
+        for key in TEMPLATE_NAMES:
+            cb = QCheckBox(pretty_name(key))
+            grid_layout.addWidget(cb)
+            self._checks[key] = cb
+        grid_layout.addStretch(1)
+        scroll.setWidget(container)
+        layout.addWidget(scroll, stretch=1)
+
+        select_all_row = QHBoxLayout()
+        select_all_btn = QPushButton("Select all")
+        select_all_btn.clicked.connect(lambda: [c.setChecked(True) for c in self._checks.values()])
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(lambda: [c.setChecked(False) for c in self._checks.values()])
+        select_all_row.addWidget(select_all_btn)
+        select_all_row.addWidget(clear_btn)
+        select_all_row.addStretch(1)
+        layout.addLayout(select_all_row)
+
+        box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        box.accepted.connect(self._on_accept)
+        box.rejected.connect(self.reject)
+        layout.addWidget(box)
+
+    def _on_accept(self):
+        TemplatePickerDialog.selected_keys = [
+            k for k, cb in self._checks.items() if cb.isChecked()
+        ]
+        self.accept()
+
 
 class ConversationListItem(QWidget):
     """Clickable list item with a delete button and copy/delete context menu."""
@@ -1124,13 +1292,34 @@ class MainWindow(QMainWindow):
         if not scope_path:
             return
 
+        # GitHub-Desktop style: optionally generate starter .vibeignore
+        # templates (context-only ignore rules — never touches git).
+        picker = TemplatePickerDialog(
+            self,
+            title=f"Generate {VIBEIGNORE_FILENAME} templates",
+            message=("Pick languages used in this project. Their build junk "
+                     "(target/, __pycache__/, node_modules/...) will be kept "
+                     f"out of the AI's context via {VIBEIGNORE_FILENAME}.\n"
+                     "Core safe defaults are always included."),
+        )
+        if picker.exec() == QDialog.DialogCode.Accepted:
+            chosen_keys = TemplatePickerDialog.selected_keys
+        else:
+            chosen_keys = []
+
         try:
-            proj_data = self.project_mgr.create_project(name.strip(), scope_path)
+            proj_data = self.project_mgr.create_project(
+                name.strip(), scope_path, vibeignore_templates=chosen_keys)
             self.current_project_id = proj_data["id"]
+            tmpl_line = (" Templates added: " + ", ".join(pretty_name(k) for k in chosen_keys)
+                         if chosen_keys else "")
             QMessageBox.information(
                 self, "Project Created",
                 f"Project '{name}' created at {scope_path}\n\n"
-                "The AI will only access files within this directory."
+                "The AI will only access files within this directory.\n\n"
+                f"A starter {VIBEIGNORE_FILENAME} was generated to save "
+                f"context.{tmpl_line}\n"
+                "You can edit it anytime from the project's right-click menu."
             )
             self._refresh_project_list()
             self._switch_to_projects()
@@ -1166,12 +1355,22 @@ class MainWindow(QMainWindow):
                     break
 
     def _populate_files_list(self, proj_id: str):
-        """Populate the files list for a project."""
-        self.files_cache = self.project_mgr.list_files(proj_id)
+        """Populate the files list for a project.
+
+        The GUI shows ALL files (force=True) so build junk stays visible to
+        the human; the model's tools see only the .vibeignore-filtered set.
+        Hidden-from-AI entries are marked with an eye-slash prefix.
+        """
+        self.files_cache = self.project_mgr.list_files(proj_id, force=True)
+        matcher = self.project_mgr.vibeignore_matcher(proj_id)
         self.files_list.clear()
         for rel_path in self.files_cache[:50]:  # Limit display
-            item = QListWidgetItem(rel_path)
+            hidden = bool(matcher and matcher.is_ignored(rel_path))
+            item = QListWidgetItem(("🚫 " if hidden else "") + rel_path)
             item.setData(Qt.ItemDataRole.UserRole, rel_path)
+            if hidden:
+                item.setToolTip(f"{rel_path} — hidden from the AI by {VIBEIGNORE_FILENAME} (double-click to view anyway)")
+                item.setForeground(Qt.GlobalColor.gray)
             self.files_list.addItem(item)
         if len(self.files_cache) > 50:
             item = QListWidgetItem(f"... and {len(self.files_cache) - 50} more")
@@ -1205,7 +1404,7 @@ class MainWindow(QMainWindow):
             return False
 
         self.current_project_id = proj_id
-        self.files_cache = self.project_mgr.list_files(proj_id)
+        self.files_cache = self.project_mgr.list_files(proj_id, force=True)
         self._refresh_git_status()
         self.statusBar().showMessage(f"Active project: {proj_data['name']}")
         return True

@@ -21,14 +21,14 @@ This is vibe coded software intended for other vibe coders who otherwise don't k
 Git commits still report failure even though they seem to be working just fine.
 /home/f/.config/vibe-coder/conversations/fa341ece-f29c-4e27-9df3-702169f8b69c.json
 
-Cases where the  conversation can extend to needs a horizontal scroll bar, there should never be a horizontal scroll bar under any circumstances.
+Cases where the  conversation can extend to need a horizontal scroll bar, there should never be a horizontal scroll bar under any circumstances.
 /home/f/.config/vibe-coder/conversations/fa341ece-f29c-4e27-9df3-702169f8b69c.json
 /home/f/.config/vibe-coder/conversations/c7eb7bb5-23d1-4cb1-baf5-df528c6ec167.json
 /home/f/.config/vibe-coder/conversations/d8ec23f1-e363-43ee-a601-a13e40b05951.json
 
-Display for context usage for the selected model and ability to alter ollama parameters graphically if possible.
-
 There should be a persistent indication of the active project (hidden if no project active) in the conversations tab so that the user does not have to switch back to the Projects tab to check the active project.
+
+There needs to be a display for model context fullness (see Lumo's implementation) so that user can determine proper context size, check if ollama supports something of this nature.
 
 Run script for easy execution.
 
@@ -40,4 +40,10 @@ LLM web extract, web search, other useful coding tool usage.
 
 Move Settings to top right, status indication to where settings is, directly above chat box.
 
+Ensure all elements are resizable, currently Conversations and Projects side tab is only out or in, add chat box resizing, critical when a text editor and file browser are integrated, will be needed to adjust layout and open different sections as different windows for ease of use.
+
 Default user system message:  My OS is <fill in user's linux distro> unless otherwise specified.
+
+Stop currently doesn't ever seem to stop generation from the model, closing the application works but I would like Stop to be a lot more of a hard stop.
+
+Application should print clearer erros when generation was interrupted (lack of context primarily, I have encountered this quite frequently)

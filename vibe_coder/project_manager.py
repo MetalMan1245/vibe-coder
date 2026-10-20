@@ -11,6 +11,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from vibe_coder.config import CONFIG_DIR
+from vibe_coder.vibeignore import (
+    VIBEIGNORE_FILENAME,
+    ensure_vibeignore,
+    load_vibeignore,
+)
 
 PROJECTS_DIR = CONFIG_DIR / "projects"
 PROJECT_INDEX = PROJECTS_DIR / "index.json"
@@ -35,8 +40,14 @@ class ProjectManager:
     def _write_index(self, entries: list[dict]) -> None:
         PROJECT_INDEX.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
 
-    def create_project(self, name: str, scope_path: Path) -> dict:
-        """Create a new project with git initialized."""
+    def create_project(self, name: str, scope_path: Path,
+                       vibeignore_templates: list[str] | None = None) -> dict:
+        """Create a new project with git initialized.
+
+        ``vibeignore_templates`` is an optional list of language keys
+        (e.g. ["python", "rust"]) used to generate the project's starter
+        ``.vibeignore`` — the context filter read only by this app.
+        """
         proj_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -46,6 +57,11 @@ class ProjectManager:
 
         # Initialize git repo
         self._init_git(scope_path)
+
+        # Seed the context-only ignore file (separate from .gitignore on
+        # purpose: internal docs can stay visible to the model while being
+        # excluded from publishing, and build junk never reaches context).
+        created, added = ensure_vibeignore(scope_path, vibeignore_templates)
 
         # Create README if one doesn't exist
         readme_path = scope_path / "README.md"
@@ -74,7 +90,11 @@ class ProjectManager:
         })
 
         # Log initialization
-        self._log_activity(proj_id, f"Project created: {name}, scope: {scope_path}")
+        self._log_activity(
+            proj_id,
+            f"Project created: {name}, scope: {scope_path}"
+            + (f", vibeignore templates: {', '.join(added)}" if added else "")
+        )
 
         return project_data
 
@@ -150,8 +170,14 @@ class ProjectManager:
             return None
         return scope
 
-    def read_file(self, proj_id: str, relative_path: str) -> str | None:
-        """Read a file within the project scope."""
+    def read_file(self, proj_id: str, relative_path: str,
+                  force: bool = False) -> str | None:
+        """Read a file within the project scope.
+
+        Files matching the project's .vibeignore are hidden from the model:
+        reading them would waste context on build junk/caches. The GUI uses
+        ``force=True`` when the *user* explicitly clicks a file.
+        """
         scope = self.get_project_scope(proj_id)
         if not scope:
             return None
@@ -165,6 +191,9 @@ class ProjectManager:
             raise PermissionError(f"Path {relative_path} is outside project scope")
 
         if not full_path.exists():
+            return None
+
+        if not force and self.is_vibe_ignored(proj_id, relative_path):
             return None
 
         try:
@@ -213,12 +242,15 @@ class ProjectManager:
         except OSError:
             return False
 
-    def list_files(self, proj_id: str, recursive: bool = True) -> list[str]:
+    def list_files(self, proj_id: str, recursive: bool = True,
+                   force: bool = False) -> list[str]:
         """List files within the project scope.
 
-        Ignores VCS/internal directories (.git, caches, aider state)
-        so listings show real project files instead of thousands of
-        repo plumbing objects.
+        Ignores VCS/internal directories (.git, caches, aider state) so
+        listings show real project files instead of thousands of repo
+        plumbing objects, then additionally applies the project's
+        ``.vibeignore`` rules (context-only filter; pass ``force=True``
+        from the GUI to include everything for the human user).
         """
         scope = self.get_project_scope(proj_id)
         if not scope:
@@ -234,17 +266,98 @@ class ProjectManager:
                     return True
             return False
 
+        matcher = None if force else self.vibeignore_matcher(proj_id)
+
         files = []
         if recursive:
             for path in scope.rglob("*"):
                 if path.is_file() and not _excluded(path):
-                    files.append(str(path.relative_to(scope)))
+                    rel = str(path.relative_to(scope))
+                    if matcher is not None and matcher.is_ignored(rel):
+                        continue
+                    files.append(rel)
         else:
             for path in scope.iterdir():
                 if path.is_file():
-                    files.append(path.name)
+                    rel = path.name
+                    if matcher is not None and matcher.is_ignored(rel):
+                        continue
+                    files.append(rel)
 
         return sorted(files)
+
+    # ------------------------------------------------------------------
+    # .vibeignore — context-only ignore rules (never affects git)
+    # ------------------------------------------------------------------
+
+    def vibeignore_matcher(self, proj_id: str):
+        """Return a cached VibeIgnore matcher for the project scope."""
+        scope = self.get_project_scope(proj_id)
+        if not scope:
+            return None
+        cache = getattr(self, "_vibeignore_cache", None)
+        if cache is None:
+            cache = self._vibeignore_cache = {}
+        entry = cache.get(proj_id)
+        if entry is not None and entry[0] == scope:
+            return entry[1]
+        matcher, warnings = load_vibeignore(scope)
+        cache[proj_id] = (scope, matcher)
+        return matcher
+
+    def reload_vibeignore(self, proj_id: str) -> tuple[int, list[str]]:
+        """Re-read .vibeignore from disk. Returns (pattern_count, warnings)."""
+        scope = self.get_project_scope(proj_id)
+        if not scope:
+            return 0, ["No project found"]
+        matcher, warnings = load_vibeignore(scope)
+        cache = getattr(self, "_vibeignore_cache", None)
+        if cache is None:
+            cache = self._vibeignore_cache = {}
+        cache[proj_id] = (scope, matcher)
+        count = len(matcher._rules) if matcher else 0
+        return count, warnings
+
+    def read_vibeignore(self, proj_id: str) -> str | None:
+        """Raw text of the project's .vibeignore (None if missing/broken)."""
+        scope = self.get_project_scope(proj_id)
+        if not scope:
+            return None
+        path = scope / VIBEIGNORE_FILENAME
+        if not path.exists():
+            return None
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+
+    def write_vibeignore(self, proj_id: str, content: str) -> bool:
+        """Save edited .vibeignore rules and refresh the cached matcher."""
+        scope = self.get_project_scope(proj_id)
+        if not scope:
+            return False
+        try:
+            (scope / VIBEIGNORE_FILENAME).write_text(content, encoding="utf-8")
+        except OSError:
+            return False
+        self._log_activity(proj_id, f"Updated: {VIBEIGNORE_FILENAME}")
+        self.reload_vibeignore(proj_id)
+        return True
+
+    def ensure_vibeignore_for_project(self, proj_id: str,
+                                      template_keys: list[str] | None = None
+                                      ) -> tuple[bool, list[str]]:
+        """Create/extend the project's .vibeignore on demand (GUI action)."""
+        scope = self.get_project_scope(proj_id)
+        if not scope:
+            return False, []
+        result = ensure_vibeignore(scope, template_keys)
+        self.reload_vibeignore(proj_id)
+        return result
+
+    def is_vibe_ignored(self, proj_id: str, relative_path: str) -> bool:
+        matcher = self.vibeignore_matcher(proj_id)
+        return bool(matcher and matcher.is_ignored(relative_path))
 
     def git_commit(self, proj_id: str, message: str) -> tuple[bool, str]:
         """Commit all changes in the project scope. Returns (success, stdout/stderr)."""

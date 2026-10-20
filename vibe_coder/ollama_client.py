@@ -114,8 +114,13 @@ class OllamaClient:
             self._response = None
 
     def complete_with_tools(self, model: str, messages: list,
-                            tools: list[dict]) -> tuple[str, list[dict], dict]:
+                            tools: list[dict],
+                            options: dict | None = None) -> tuple[str, list[dict], dict]:
         """Non-streaming chat with tool support.
+
+        Takes four positional arguments (plus ``self``): ``model``,
+        ``messages``, ``tools`` and an optional ``options`` dict that is
+        forwarded to Ollama as generation options when provided.
 
         Returns (content, tool_calls, message) where message is the full
         assistant message dict (including any tool_calls), suitable for
@@ -129,8 +134,10 @@ class OllamaClient:
             "model": model,
             "messages": messages,
             "stream": False,
-            "tools": tools,
+            "tools": tools or [],
         }
+        if options:
+            payload["options"] = options
         resp = requests.post(
             f"{self.server_url}/api/chat",
             json=payload,
